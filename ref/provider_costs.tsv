@@ -1,0 +1,7 @@
+# Example provider cost configuration for the public package
+provider	billing_start	plan_type	monthly_cost	extra_usage	notes
+anthropic	2026-01-01	flat_plus_usage	20	0	Example: Pro plan base + manual usage adjustments
+github-copilot	2026-01-01	flat	39		Example: monthly subscription
+openai-codex	2026-01-01	flat	200		Example: monthly subscription
+moonshot	2026-01-01	payg			PAYG provider; record actual spend separately if you extend the schema
+opencode	2026-01-01	free	0		Free tier example

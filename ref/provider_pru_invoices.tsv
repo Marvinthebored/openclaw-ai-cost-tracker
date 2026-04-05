@@ -1,0 +1,2 @@
+# Template file. Leave empty until you have per-model PRU invoice data to import.
+provider	cycle_start	cycle_end	model_raw	prus	included_requests	billed_requests	notes
