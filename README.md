@@ -1,6 +1,6 @@
-# AI Cost Tracker (Public Package)
+# AI Cost Tracker
 
-Standalone, sanitized version of the AI Cost Tracker originally built for local OpenClaw session logs.
+Standalone cost tracker for OpenClaw session logs.
 
 ## What it does
 
@@ -14,18 +14,11 @@ Standalone, sanitized version of the AI Cost Tracker originally built for local 
 
 - `migrate_sessions.py` — builds / updates the SQLite database from OpenClaw logs
 - `server.py` — small standalone HTTP server for the dashboard and JSON API
-- `dashboard.html` — UI copied from the live tracker and sanitized for public use
+- `dashboard.html` — browser UI for filtering, grouping, and inspection
 - `schema.sql` — SQLite schema
 - `ref_export.py`, `ref_import.py`, `import_pru_invoice_csv.py` — helper scripts for reference data
-- `ref/*.tsv` — safe example TSVs/templates
+- `ref/*.tsv` — editable TSV lookup/config tables
 - `channel_mapping.example.json` — optional channel-id mapping example
-
-## What is intentionally not included
-
-- live databases, WAL/SHM files, backups, caches
-- Obsidian / Things3 / workspace notes
-- absolute local machine paths
-- Marvin's monolithic `dashboard_server.py`
 
 ## Prerequisites
 
@@ -165,22 +158,12 @@ python3 import_pru_invoice_csv.py \
   invoice.csv
 ```
 
-## Customization notes
+## Notes
 
 - The seeded `MODEL_REFERENCE_DATA` and `PROVIDER_COST_DATA` in `migrate_sessions.py` are defaults, not gospel.
 - Unknown models are auto-added to `model_reference` during ingest.
 - Channel mapping is optional; without it, the tracker still works.
-- The public dashboard intentionally disables the local "open file in TextEdit" behavior from the original private environment.
-- This package is honest about its scope: it is built for OpenClaw session logs, not for arbitrary chat exports.
-
-## Suggested first cleanup before publishing
-
-Before pushing publicly, you may still want to:
-
-- choose a final repo name
-- add screenshots / demo GIFs to the README
-- decide whether to keep the sample TSV defaults as-is or trim them further
-- run one clean end-to-end test on a non-private sample log set
+- This project is built for OpenClaw session logs, not arbitrary chat exports.
 
 ## License
 
