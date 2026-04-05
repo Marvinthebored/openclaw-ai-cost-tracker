@@ -8,6 +8,7 @@ Standalone cost tracker for OpenClaw session logs.
 - tracks per-message and per-session token usage
 - splits sessions into model segments when the model changes mid-session
 - serves a browser dashboard for filtering, grouping, and estimated cost analysis
+- opens raw OpenClaw session logs in a new browser tab when you click a session entry
 - shows source session-file metadata alongside tracked sessions
 - includes browser download/upload actions for the editable reference TSV tables (`provider_costs`, `model_reference`, `provider_pru_invoices`)
 
@@ -120,7 +121,14 @@ Use this for normal day-to-day refreshes.
   - per-message detail rows
   - provider totals
   - reference-table data used for cost estimation
+- clicking a session entry opens the raw underlying OpenClaw log in a new browser tab for direct browsing
 - clicking **Refresh** calls the migration script in incremental mode
+
+## Raw session log browsing
+
+Session rows link to a public-package web endpoint that serves the matching raw log file directly from the configured `--sessions-dir`.
+
+If you run the tracker locally and prefer a different workflow, you can customize that endpoint to launch your preferred editor instead. The default package behavior stays browser-based and platform-agnostic.
 
 ## Reference data
 

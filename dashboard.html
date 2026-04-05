@@ -1323,10 +1323,14 @@ function renderTable() {
             statusIcon = `<span class="trash-icon" title="${t}">🗑️</span>`;
         }
 
-        const filepath = ''; // Local file opener intentionally disabled in the public package.
         const rowId = isGrouped ? s.session_id : `${s.session_id}__${s.model_raw}__${s.segment_index}`;
         const isExpanded = (!isGrouped) && expandedSessions.has(rowId);
         const expanderHtml = isGrouped ? '' : `<span class="expander" onclick="toggleDetails(event, '${rowId}')">${isExpanded ? '[-]' : '[+]'}</span>`;
+        const sessionLabel = s.session_nickname || formatSessionId(s.session_id);
+        const sessionTitle = filename || s.session_id || '-';
+        const sessionLink = (!isGrouped && s.session_id)
+            ? `<a href="/session-log/${encodeURIComponent(s.session_id)}" class="id-link" target="_blank" rel="noopener" title="Open raw session log: ${sessionTitle}">${sessionLabel}</a>`
+            : `<span class="id-link" title="${sessionTitle}">${sessionLabel}</span>`;
         
         const costEst = isGrouped ? (s.cost_estimated || 0) : calculateCostEst(s);
         const mtok = (s.total_tokens || 0) / 1e6;
@@ -1335,12 +1339,12 @@ function renderTable() {
 
         // Session row
         rows.push(`
-        <tr class="session-row" data-rowid="${rowId}" data-filepath="${filepath}">
+        <tr class="session-row" data-rowid="${rowId}">
             <td class="date" style="padding-left: 4px; width: 20px;">${expanderHtml}</td>
             <td class="date" style="padding-right: 2px;">${formatDate(s.first_msg_ts || s.created_at)}</td>
             <td class="date" style="color: var(--text-muted); padding-left: 2px;">${formatLastTime(s.first_msg_ts || s.created_at, s.last_msg_ts)}</td>
             <td class="num" style="width: 30px;">${s.msg_count || 0}</td>
-            <td class="id-cell" style="width: 36px;"><a href="#" class="id-link" title="${filename || s.session_id || '-'}">${s.session_nickname || formatSessionId(s.session_id)}</a>${statusIcon}</td>
+            <td class="id-cell" style="width: 36px;">${sessionLink}${statusIcon}</td>
             <td>${formatSource(s.session_type)}</td>
             <td class="channel" title="${s.channel_name || ''}">${s.channel_name || '-'}</td>
             <td class="label" title="${s.parent_nickname || ''}">${s.parent_nickname || '-'}</td>
@@ -1393,8 +1397,6 @@ function renderTable() {
     
     tbody.innerHTML = rows.join('');
     updateGroupIndicators();
-    
-    // Local file-opening hooks from the private environment are intentionally disabled here.
 }
 
 function toggleDetails(event, rowId) {

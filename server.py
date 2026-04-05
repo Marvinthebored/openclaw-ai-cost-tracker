@@ -4,14 +4,14 @@
 import argparse
 import json
 import re
-import socketserver
 import sqlite3
 import subprocess
 import sys
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from socketserver import ThreadingMixIn
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
+import socketserver
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / 'cost_tracker.db'
@@ -60,12 +60,14 @@ class TrackerHandler(BaseHTTPRequestHandler):
     def cfg(self):
         return self.server.config
 
-    def _respond(self, code, body, content_type='text/plain; charset=utf-8'):
+    def _respond(self, code, body, content_type='text/plain; charset=utf-8', headers=None):
         if isinstance(body, str):
             body = body.encode('utf-8')
         self.send_response(code)
         self.send_header('Content-Type', content_type)
         self.send_header('Content-Length', str(len(body)))
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
         self.end_headers()
         self.wfile.write(body)
 
@@ -83,8 +85,12 @@ class TrackerHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
+
         if path in ('/', '/index.html', '/cost/v3'):
             self.serve_dashboard()
+            return
+        if path.startswith('/session-log/'):
+            self.handle_session_log(unquote(path[len('/session-log/'):]))
             return
         if path == '/api/cost-v3/sessions':
             self.handle_sessions()
@@ -120,6 +126,58 @@ class TrackerHandler(BaseHTTPRequestHandler):
             self._respond(404, f'Dashboard not found: {dashboard}')
             return
         self._respond(200, dashboard.read_text(encoding='utf-8'), 'text/html; charset=utf-8')
+
+    def handle_session_log(self, session_id):
+        if not session_id:
+            self._respond(404, 'Session log not found\n')
+            return
+
+        conn = self._db()
+        if not conn:
+            self._respond(500, f'Database not found: {self.cfg["db"]}\n')
+            return
+
+        try:
+            row = conn.execute(
+                'SELECT filename FROM sessions WHERE session_id = ? LIMIT 1',
+                (session_id,),
+            ).fetchone()
+        except Exception as exc:
+            self._respond(500, f'Failed to look up session log: {exc}\n')
+            return
+        finally:
+            conn.close()
+
+        filename = row['filename'] if row else None
+        if not filename or Path(filename).name != filename:
+            self._respond(404, 'Session log not found\n')
+            return
+
+        sessions_dir = self.cfg['sessions_dir'].resolve()
+        file_path = (sessions_dir / filename).resolve()
+        try:
+            file_path.relative_to(sessions_dir)
+        except ValueError:
+            self._respond(404, 'Session log not found\n')
+            return
+
+        if not file_path.is_file():
+            self._respond(404, 'Session log not found\n')
+            return
+
+        try:
+            body = file_path.read_bytes()
+        except Exception as exc:
+            self._respond(500, f'Failed to read session log: {exc}\n')
+            return
+
+        safe_filename = filename.replace('"', '')
+        self._respond(
+            200,
+            body,
+            'text/plain; charset=utf-8',
+            headers={'Content-Disposition': f'inline; filename="{safe_filename}"'},
+        )
 
     def handle_sessions(self):
         conn = self._db()
@@ -252,9 +310,9 @@ class TrackerHandler(BaseHTTPRequestHandler):
                 'provider_costs': provider_costs,
                 'provider_cost_periods': provider_cost_periods,
                 'provider_total_prus': provider_total_prus,
-                'copilot_opus_tokens': (tier_row['opus_tokens'] or 0) if tier_row else 0,
-                'copilot_other_tokens': (tier_row['other_tokens'] or 0) if tier_row else 0,
-                'copilot_other_prus': (tier_row['other_prus'] or 0) if tier_row else 0,
+                'copilot_opus_tokens': tier_row['opus_tokens'] if tier_row else 0,
+                'copilot_other_tokens': tier_row['other_tokens'] if tier_row else 0,
+                'copilot_other_prus': tier_row['other_prus'] if tier_row else 0,
             })
         finally:
             conn.close()
@@ -276,12 +334,12 @@ class TrackerHandler(BaseHTTPRequestHandler):
             ok = result.returncode == 0
             processed_files = 0
             processed_msgs = 0
-            match = re.search(r'Processed (\d+) files', output)
-            if match:
-                processed_files = int(match.group(1))
-            match = re.search(r'Assistant messages ingested/upserted: (\d+)', output)
-            if match:
-                processed_msgs = int(match.group(1))
+            m = re.search(r'Processed (\d+) files', output)
+            if m:
+                processed_files = int(m.group(1))
+            m = re.search(r'Assistant messages ingested/upserted: (\d+)', output)
+            if m:
+                processed_msgs = int(m.group(1))
             self._json(200 if ok else 500, {
                 'success': ok,
                 'new_sessions': processed_files,
@@ -326,15 +384,15 @@ class TrackerHandler(BaseHTTPRequestHandler):
                 return
             if table == 'provider_costs':
                 conn.execute('DELETE FROM provider_costs')
-                for row in rows:
+                for r in rows:
                     conn.execute(
                         'INSERT INTO provider_costs (provider, billing_start, plan_type, monthly_cost, extra_usage, notes) VALUES (?,?,?,?,?,?)',
-                        (row.get('provider'), row.get('billing_start'), row.get('plan_type', 'flat'), row.get('monthly_cost'), row.get('extra_usage'), row.get('notes')),
+                        (r.get('provider'), r.get('billing_start'), r.get('plan_type', 'flat'), r.get('monthly_cost'), r.get('extra_usage'), r.get('notes')),
                     )
             elif table == 'model_reference':
-                for row in rows:
+                for r in rows:
                     conn.execute(
-                        """
+                        '''
                         INSERT INTO model_reference (model_raw, endpoint, author, model, pru_multiplier)
                         VALUES (?,?,?,?,?)
                         ON CONFLICT(model_raw) DO UPDATE SET
@@ -342,15 +400,15 @@ class TrackerHandler(BaseHTTPRequestHandler):
                             author=excluded.author,
                             model=excluded.model,
                             pru_multiplier=excluded.pru_multiplier
-                        """,
-                        (row.get('model_raw'), row.get('endpoint', ''), row.get('author', ''), row.get('model', ''), row.get('pru_multiplier', 1.0)),
+                        ''',
+                        (r.get('model_raw'), r.get('endpoint', ''), r.get('author', ''), r.get('model', ''), r.get('pru_multiplier', 1.0)),
                     )
             else:
                 conn.execute('DELETE FROM provider_pru_invoices')
-                for row in rows:
+                for r in rows:
                     conn.execute(
                         'INSERT INTO provider_pru_invoices (provider, cycle_start, cycle_end, model_raw, prus, included_requests, billed_requests, notes) VALUES (?,?,?,?,?,?,?,?)',
-                        (row.get('provider'), row.get('cycle_start'), row.get('cycle_end'), row.get('model_raw'), row.get('prus', 0), row.get('included_requests'), row.get('billed_requests', 0), row.get('notes')),
+                        (r.get('provider'), r.get('cycle_start'), r.get('cycle_end'), r.get('model_raw'), r.get('prus', 0), r.get('included_requests'), r.get('billed_requests', 0), r.get('notes')),
                     )
             conn.commit()
             self._json(200, {'ok': True, 'table': table, 'saved': len(rows)})
