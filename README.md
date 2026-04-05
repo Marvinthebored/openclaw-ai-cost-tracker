@@ -8,7 +8,8 @@ Standalone cost tracker for OpenClaw session logs.
 - tracks per-message and per-session token usage
 - splits sessions into model segments when the model changes mid-session
 - serves a browser dashboard for filtering, grouping, and estimated cost analysis
-- lets you edit reference tables (`provider_costs`, `model_reference`, `provider_pru_invoices`) via TSV or the browser UI
+- shows source session-file metadata alongside tracked sessions
+- includes browser download/upload actions for the editable reference TSV tables (`provider_costs`, `model_reference`, `provider_pru_invoices`)
 
 ## What is included
 
@@ -123,7 +124,10 @@ Use this for normal day-to-day refreshes.
 
 ## Reference data
 
-The tracker uses three editable reference tables:
+The tracker uses three editable reference tables.
+
+In the browser UI, these tables can be downloaded as TSV, edited externally, and uploaded back into the tracker.
+
 
 - `provider_costs` — billing periods and plan types
 - `model_reference` — display labels and PRU multipliers
