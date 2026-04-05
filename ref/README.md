@@ -36,6 +36,10 @@ This is the table that tells the tracker how to spread provider costs across tim
 
 Used to store per-model GitHub PRU invoice/usage rows for more granular pro-rata cost work.
 
+Why it exists:
+- to preserve a place for real invoice-side PRU data when you want to reconcile or compare the tracker’s token-weighted estimates against billed per-model usage
+- to support a future finer-grained GitHub/Copilot allocation path without redesigning the reference-data structure later
+
 Contains:
 - provider name
 - billing cycle dates
@@ -57,5 +61,6 @@ So this PRU invoice table is currently best understood as:
 - useful reference data
 - import/export-ready
 - available for future finer-grained reconciliation
+- a placeholder for a path that is **not currently implemented** in the active estimator
 
 But it is **not** presently feeding the main estimate calculations.
