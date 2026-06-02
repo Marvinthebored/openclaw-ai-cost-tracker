@@ -4,7 +4,6 @@
 import argparse
 import csv
 import io
-import re
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -20,7 +19,7 @@ TABLES = {
         'columns': ['model_raw', 'endpoint', 'author', 'model', 'pru_multiplier'],
         'numeric': {'pru_multiplier'},
         'delete_first': False,
-        'insert': """
+        'insert': '''
             INSERT INTO model_reference (model_raw, endpoint, author, model, pru_multiplier)
             VALUES (?,?,?,?,?)
             ON CONFLICT(model_raw) DO UPDATE SET
@@ -28,7 +27,7 @@ TABLES = {
                 author=excluded.author,
                 model=excluded.model,
                 pru_multiplier=excluded.pru_multiplier
-        """,
+        ''',
     },
     'provider_pru_invoices': {
         'columns': ['provider', 'cycle_start', 'cycle_end', 'model_raw', 'prus', 'included_requests', 'billed_requests', 'notes'],
@@ -57,7 +56,7 @@ def parse_tsv(path: Path, meta: dict):
         for raw_line in f:
             if raw_line.startswith('#'):
                 if 'Exported:' in raw_line:
-                    match = re.search(r'Exported:\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})', raw_line)
+                    match = __import__('re').search(r'Exported:\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})', raw_line)
                     if match:
                         export_ts = datetime.strptime(match.group(1), '%Y-%m-%d %H:%M:%S')
                 continue
@@ -67,16 +66,16 @@ def parse_tsv(path: Path, meta: dict):
         print(f'{path.name}: exported {age_hrs:.1f}h ago')
     reader = csv.DictReader(io.StringIO(''.join(lines)), delimiter='\t')
     for line in reader:
-        values = []
+        vals = []
         for col in meta['columns']:
             value = (line.get(col, '') or '').strip()
             if value == '':
-                values.append(None)
+                vals.append(None)
             elif col in meta['numeric']:
-                values.append(float(value))
+                vals.append(float(value))
             else:
-                values.append(value)
-        rows.append(tuple(values))
+                vals.append(value)
+        rows.append(tuple(vals))
     return rows
 
 

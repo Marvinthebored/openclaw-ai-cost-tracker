@@ -53,7 +53,7 @@ def main():
                 writer = csv.writer(f, delimiter='\t')
                 writer.writerow(meta['columns'])
                 for row in rows:
-                    writer.writerow(['' if value is None else value for value in row])
+                    writer.writerow(['' if v is None else v for v in row])
             print(f'Exported {name} -> {out}')
     finally:
         conn.close()

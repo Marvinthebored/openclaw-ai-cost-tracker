@@ -3,7 +3,7 @@
 ## What was packaged
 
 - standalone `server.py` replacing the dependency on Marvin's `dashboard_server.py`
-- sanitized `dashboard.html` copied from the live tracker
+- sanitized v3.1 `dashboard.html` copied from the live tracker, using lazy message drilldown
 - portable `migrate_sessions.py` with CLI-configurable paths
 - portable reference-table utilities:
   - `ref_export.py`
@@ -15,16 +15,12 @@
 
 ## Important caveats
 
-- this package still assumes the input format is OpenClaw session `.jsonl`
+- this package assumes OpenClaw session `.jsonl` files and Codex CLI session transcripts
 - no sample session logs are included
-- no license file yet
-- no Git metadata has been initialized yet
+- git remote: `https://github.com/Marvinthebored/openclaw-ai-cost-tracker.git`
 - the dashboard UI is inline HTML/JS copied from the live tracker, so future UI changes will need manual sync
 
 ## Remaining pre-publish checks
 
-1. run one clean full ingest in a fresh clone
-2. verify the dashboard against a small non-private sample log set
-3. add LICENSE
-4. optionally add screenshots
-5. decide final repository name and description
+1. optionally add screenshots
+2. optionally add a tiny bundled sample log fixture for demo mode

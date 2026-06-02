@@ -1,10 +1,10 @@
 # AI Cost Tracker
 
-Standalone cost tracker for OpenClaw session logs.
+Standalone cost tracker for OpenClaw and Codex CLI session logs.
 
 ## What it does
 
-- ingests OpenClaw session `.jsonl` logs into SQLite
+- ingests OpenClaw session `.jsonl` logs and Codex CLI session transcripts into SQLite
 - tracks per-message and per-session token usage
 - splits sessions into model segments when the model changes mid-session
 - serves a browser dashboard for filtering, grouping, and estimated cost analysis
@@ -14,7 +14,7 @@ Standalone cost tracker for OpenClaw session logs.
 
 ## What is included
 
-- `migrate_sessions.py` — builds / updates the SQLite database from OpenClaw logs
+- `migrate_sessions.py` — builds / updates the SQLite database from OpenClaw and Codex CLI logs
 - `server.py` — small standalone HTTP server for the dashboard and JSON API
 - `dashboard.html` — browser UI for filtering, grouping, and inspection
 - `schema.sql` — SQLite schema
@@ -25,22 +25,35 @@ Standalone cost tracker for OpenClaw session logs.
 ## Prerequisites
 
 - Python 3.11+ recommended
-- OpenClaw session logs available locally
+- OpenClaw session logs and/or Codex CLI session logs available locally
 - modern browser
 
 No third-party Python packages are required; everything here uses the standard library.
 
 ## Quick start
 
+Clone the repo and enter the package directory:
+
+```bash
+git clone https://github.com/Marvinthebored/openclaw-ai-cost-tracker.git
+cd openclaw-ai-cost-tracker
+```
+
 ### 1) Choose a sessions directory
 
-Default expected location:
+Default OpenClaw location:
 
 ```bash
 ~/.openclaw/agents/main/sessions
 ```
 
-If your logs live elsewhere, pass `--sessions-dir` explicitly in the commands below.
+Codex CLI is also auto-discovered by default at:
+
+```bash
+~/.codex/sessions
+```
+
+If your logs live elsewhere, pass `--sessions-dir` and/or `--codex-sessions-dir` explicitly in the commands below.
 
 ### 2) Build the database
 
@@ -55,6 +68,14 @@ Or with an explicit sessions path:
 ```bash
 python3 migrate_sessions.py --full \
   --sessions-dir /path/to/openclaw/agents/main/sessions
+```
+
+With both OpenClaw and Codex paths pinned explicitly:
+
+```bash
+python3 migrate_sessions.py --full \
+  --sessions-dir /path/to/openclaw/agents/main/sessions \
+  --codex-sessions-dir /path/to/.codex/sessions
 ```
 
 Optional: add a channel mapping file so Discord / Telegram channel IDs render as names:
@@ -82,12 +103,13 @@ If you used a non-default sessions directory and want the dashboard's **Refresh*
 ```bash
 python3 server.py \
   --sessions-dir /path/to/openclaw/agents/main/sessions \
+  --codex-sessions-dir /path/to/.codex/sessions \
   --channel-mapping /path/to/channel_mapping.json
 ```
 
 ## Ingest flow
 
-1. `migrate_sessions.py` scans OpenClaw `.jsonl` session files.
+1. `migrate_sessions.py` scans OpenClaw `.jsonl` session files and Codex CLI session transcripts.
 2. Session metadata goes into `sessions`.
 3. Assistant messages and token/cost data go into `messages`.
 4. Consecutive messages using the same model are rolled into `segments`.
@@ -115,10 +137,11 @@ Use this for normal day-to-day refreshes.
 ## Run flow
 
 - `server.py` serves `dashboard.html`
-- the browser calls `/api/cost-v3/sessions`
+- the browser calls `/api/cost-v31/sessions` for segment summaries
+- expanded rows call `/api/cost-v31/messages` on demand, so large databases do not eagerly ship every message to the browser
 - the server queries SQLite and returns:
   - session segment rows
-  - per-message detail rows
+  - per-message detail rows when requested
   - provider totals
   - reference-table data used for cost estimation
 - clicking a session entry opens the raw underlying OpenClaw log in a new browser tab for direct browsing
@@ -126,7 +149,7 @@ Use this for normal day-to-day refreshes.
 
 ## Raw session log browsing
 
-Session rows link to a public-package web endpoint that serves the matching raw log file directly from the configured `--sessions-dir`.
+Session rows link to a public-package web endpoint that serves the matching raw log file directly from the configured OpenClaw or Codex session directory.
 
 If you run the tracker locally and prefer a different workflow, you can customize that endpoint to launch your preferred editor instead. The default package behavior stays browser-based and platform-agnostic.
 
@@ -174,8 +197,9 @@ python3 import_pru_invoice_csv.py \
 
 - The seeded `MODEL_REFERENCE_DATA` and `PROVIDER_COST_DATA` in `migrate_sessions.py` are defaults, not gospel.
 - Unknown models are auto-added to `model_reference` during ingest.
+- Codex CLI sessions are imported with `model_raw` values prefixed `codex_cli/`.
 - Channel mapping is optional; without it, the tracker still works.
-- This project is built for OpenClaw session logs, not arbitrary chat exports.
+- This project is built for OpenClaw session logs and Codex CLI transcripts, not arbitrary chat exports.
 
 ## License
 

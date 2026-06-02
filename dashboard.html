@@ -3,7 +3,8 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI Cost Tracker</title>
+    <title>AI Cost Tracker v3.1 - Marvin's Workshop</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml">
     <style>
         :root {
             --bg: #0d1117;
@@ -27,7 +28,7 @@
             font-size: 13px;
         }
         .container { margin: 0; padding: 0 16px; box-sizing: border-box; overflow-x: auto; }
-        
+
         header {
             margin-bottom: 20px;
             padding-bottom: 12px;
@@ -52,11 +53,11 @@
             display: none;
         }
         .warning-bar strong { color: var(--red); }
-        
+
         /* Total row in header */
         .total-row { background: rgba(88, 166, 255, 0.1); }
         .total-row td { border-bottom: 2px solid var(--border); padding: 6px 8px; }
-        
+
         h2 {
             color: var(--text-muted);
             font-size: 11px;
@@ -65,7 +66,7 @@
             letter-spacing: 0.5px;
             margin: 20px 0 10px 0;
         }
-        
+
         /* Controls */
         .controls {
             display: flex;
@@ -89,7 +90,7 @@
             font-size: 12px;
         }
         select:focus, input:focus { outline: none; border-color: var(--accent); }
-        
+
         /* Table */
         .table-container {
             overflow-x: auto;
@@ -123,27 +124,27 @@
         th:hover { color: var(--accent); }
         th.sort-asc::after { content: " ▲"; font-size: 9px; }
         th.sort-desc::after { content: " ▼"; font-size: 9px; }
-        
+
         /* Alternating row colors - A,A,B,B pattern */
         tr:nth-child(4n+1), tr:nth-child(4n+2) { background: rgba(0, 0, 0, 0.15); }
         tr:nth-child(4n+3), tr:nth-child(4n+4) { background: transparent; }
         tr:hover { background: rgba(88, 166, 255, 0.08); }
         tr:last-child td { border-bottom: none; }
-        
+
         /* Cell styles */
         .num { text-align: right; font-family: 'SF Mono', Monaco, monospace; white-space: nowrap; }
         .id-cell { font-family: 'SF Mono', Monaco, monospace; }
         .id-link { color: var(--accent); text-decoration: none; cursor: pointer; font-weight: 600; }
         .id-link:hover { text-decoration: underline; }
-        .parent-id { 
-            font-family: 'SF Mono', Monaco, monospace; 
+        .parent-id {
+            font-family: 'SF Mono', Monaco, monospace;
             color: var(--text-muted);
             font-size: 11px;
         }
         .endpoint { color: var(--yellow); font-weight: 500; }
         .author { color: var(--text-muted); }
         .model { color: var(--green); }
-        .channel { color: var(--text-muted); font-size: 11px; max-width: 100px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .channel { color: var(--text-muted); font-size: 11px; max-width: 70px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .label { max-width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .type-badge {
             display: inline-block;
@@ -159,7 +160,7 @@
         .cost-logged { color: var(--cost-logged); }
         .col-cost { min-width: 72px; }
         .col-mtok { min-width: 68px; }
-        
+
         .breadcrumb {
             font-size: 12px;
             margin-bottom: 12px;
@@ -167,10 +168,10 @@
         .breadcrumb a { color: var(--accent); text-decoration: none; }
         .breadcrumb a:hover { text-decoration: underline; }
         .breadcrumb .sep { color: var(--text-muted); margin: 0 6px; }
-        
+
         .loading { color: var(--text-muted); padding: 20px; text-align: center; }
         .error { color: var(--red); padding: 20px; }
-        
+
         /* Deleted row indicator - no opacity change, just the icon */
         .trash-icon { font-size: 9px; margin-left: 3px; opacity: 0.6; }
         .reset-icon { font-size: 9px; margin-left: 3px; opacity: 0.7; }
@@ -183,7 +184,7 @@
             padding-left: 6px;
             text-align: left;
         }
-        
+
         /* Filter button in column headers */
         .filter-btn {
             font-size: 10px;
@@ -213,7 +214,7 @@
             background: rgba(63, 185, 80, 0.06);
             box-shadow: inset 0 -2px 0 rgba(63, 185, 80, 0.8);
         }
-        
+
         /* Filter dropdown menu */
         .filter-menu {
             position: fixed;
@@ -270,11 +271,11 @@
 <body>
 <div class="container">
     <header>
-        <h1>🤖 AI Cost Tracker</h1>
+        <h1>🤖 AI Cost Tracker v3.1</h1>
         <div class="timestamp">Generated: <span id="generated-time">Loading...</span></div>
         <div id="warning-bar" class="warning-bar"></div>
     </header>
-    
+
     <div class="controls">
         <div class="control-group">
             <label>TZ</label>
@@ -304,6 +305,12 @@
                 <option value="mtok" selected>Mtok</option>
             </select>
         </div>
+        <div class="control-group">
+            <label title="Hide expanded drilldown messages with no usage tokens">
+                <input type="checkbox" id="hide-no-usage-messages" checked />
+                Hide no-usage
+            </label>
+        </div>
         <div class="control-group" style="margin-left:auto; display: flex; gap: 8px; align-items: center;">
             <button id="refresh-btn" onclick="refreshData()" style="background: #4CAF50; border: none; color: white; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-weight: 500;">⟳ Refresh</button>
             <button onclick="clearFilters()" style="background: var(--card-bg); border: 1px solid var(--border); color: var(--text); padding: 6px 10px; border-radius: 4px; cursor: pointer;">Clear</button>
@@ -326,9 +333,10 @@
             </div>
         </div>
     </div>
-    
+
     <h2>Session Details</h2>
-    
+    <div class="timestamp">Normal cost columns are PAYG-equivalent token costs; CLI rows may be calculated from token usage. COST(Est.) remains the separate subscription/pro-rata allocation.</div>
+
     <div class="table-container">
         <table id="sessions-table">
             <thead>
@@ -337,7 +345,7 @@
                     <td colspan="3" class="num" style="text-align: left;"><strong id="total-sessions">-</strong> sessions</td>
                     <td class="num" style="width: 30px;"><strong id="total-requests">-</strong></td>
                     <td colspan="2" class="req-label">requests</td>
-                    <td colspan="4"></td>
+                    <td colspan="3"></td>
                     <td class="num"><strong id="total-input">-</strong></td>
                     <td class="num"><strong id="total-cache-read">-</strong></td>
                     <td class="num"><strong id="total-cache-write">-</strong></td>
@@ -358,9 +366,8 @@
                     <th data-sort="last_msg_ts" style="padding-left: 2px;">LAST</th>
                     <th data-sort="msg_count" class="num" style="width: 30px;">#</th>
                     <th data-sort="session_nickname" style="width: 36px;">log</th>
-                    <th data-sort="session_type">Source <span class="filter-btn" data-filter="session_type" onclick="event.stopPropagation(); openFilter('session_type')">☰</span></th>
-                    <th data-sort="channel_name">Channel <span class="filter-btn" data-filter="channel_name" onclick="event.stopPropagation(); openFilter('channel_name')">☰</span></th>
-                    <th data-sort="parent_nickname">Label <span class="filter-btn" data-filter="parent_nickname" onclick="event.stopPropagation(); openFilter('parent_nickname')">☰</span></th>
+                    <th data-sort="src_display">SRC <span class="filter-btn" data-filter="src_display" onclick="event.stopPropagation(); openFilter('src_display')">☰</span></th>
+                    <th data-sort="display_channel">Channel <span class="filter-btn" data-filter="display_channel" onclick="event.stopPropagation(); openFilter('display_channel')">☰</span></th>
                     <th data-sort="endpoint">Endpoint <span class="filter-btn" data-filter="endpoint" onclick="event.stopPropagation(); openFilter('endpoint')">☰</span></th>
                     <th data-sort="model">Model <span class="filter-btn" data-filter="model" onclick="event.stopPropagation(); openFilter('model')">☰</span></th>
                     <th data-sort="input_tokens" class="num">Input</th>
@@ -369,9 +376,9 @@
                     <th data-sort="total_in" class="num">Total In</th>
                     <th data-sort="output_tokens" class="num">Output</th>
                     <th data-sort="total_tokens" class="num">All Tokens</th>
-                    <th data-sort="cost_io" class="num cost-logged col-cost">Cost I+O</th>
-                    <th data-sort="cost_cache" class="num cost-logged col-cost">Cost Cache</th>
-                    <th data-sort="cost_logged" class="num cost-logged col-cost">Cost Total</th>
+                    <th data-sort="cost_io" class="num cost-logged col-cost">PAYG I+O</th>
+                    <th data-sort="cost_cache" class="num cost-logged col-cost">PAYG Cache</th>
+                    <th data-sort="cost_logged" class="num cost-logged col-cost">PAYG Total</th>
                     <th class="num cost-logged col-mtok">/MTOK</th>
                     <th data-sort="cost_estimated" class="num col-cost">COST(Est.)</th>
                     <th class="num">/MTOK</th>
@@ -387,8 +394,10 @@
 <script>
 // State
 let sessionsData = [];
+const COST_API_BASE = '/api/cost-v31';
 let messagesData = [];
-let messagesBySessionIdx = {}; // {session_id: [message, ...]} (built after load)
+let messagesBySegmentCache = {}; // cacheKey -> [message, ...] loaded on demand
+let loadingDetailKeys = new Set();
 let providerTotals = {};  // {endpoint: total_tokens}
 let providerCosts = {};   // {provider: {plan_type, monthly_cost, ...}} (latest period per provider)
 let providerCostPeriods = {};  // {provider: [{billing_start, plan_type, monthly_cost, extra_usage, notes}, ...]}
@@ -410,6 +419,7 @@ let filters = {
     channel: ''
 };
 let tokenDisplay = localStorage.getItem('costTrackerTokenDisplay') || 'mtok';
+let hideNoUsageMessages = localStorage.getItem('costTrackerHideNoUsageMessages') !== 'false';
 let selectedTz = 'Asia/Hong_Kong';
 let expandedSessions = new Set();  // Track which sessions are expanded
 let headerFilters = {};  // Filter state for column header filters (key -> Set of selected values)
@@ -422,6 +432,7 @@ const dateEnd = document.getElementById('date-end');
 const timeStart = document.getElementById('time-start');
 const timeEnd = document.getElementById('time-end');
 const tokenDisplaySelect = document.getElementById('token-display');
+const hideNoUsageMessagesInput = document.getElementById('hide-no-usage-messages');
 const tzSelect = document.getElementById('tz-select');
 const warningBar = document.getElementById('warning-bar');
 
@@ -442,6 +453,7 @@ function addWarningOnce(key, text) {
 
 // Set token display from saved preference
 if (tokenDisplaySelect) tokenDisplaySelect.value = tokenDisplay;
+if (hideNoUsageMessagesInput) hideNoUsageMessagesInput.checked = hideNoUsageMessages;
 
 // Timezone helpers
 function getSelectedTz() {
@@ -463,6 +475,22 @@ function formatTsForDisplay(tsStr, tz) {
     const map = {};
     parts.forEach(p => { map[p.type] = p.value; });
     return `${map.year}-${map.month}-${map.day} ${map.hour}:${map.minute}`;
+}
+
+function formatMainDate(tsStr, tz) {
+    const d = new Date(tsStr);
+    if (isNaN(d.getTime())) return tsStr || '-';
+    const parts = new Intl.DateTimeFormat('en-GB', {
+        timeZone: tz,
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false
+    }).formatToParts(d);
+    const map = {};
+    parts.forEach(p => { map[p.type] = p.value; });
+    return `${map.month}-${map.day} ${map.hour}:${map.minute}`;
 }
 
 function tzLocalToUtcIso(dateStr, timeStr, tz) {
@@ -503,6 +531,11 @@ function formatTokens(n) {
     }
 }
 
+function messageHasUsage(m) {
+    return ['input_tokens', 'cache_read', 'cache_write', 'output_tokens', 'total_tokens']
+        .some(key => Number(m?.[key] || 0) > 0);
+}
+
 function formatCost(n) {
     if (n === null || n === undefined) return '-';
     if (n < 0.001 && n > 0) return '<$0.001';
@@ -518,18 +551,17 @@ function formatCostPerMtok(n) {
 
 function formatDate(isoString) {
     if (!isoString) return '-';
-    // Format in selected timezone - show date and time
-    return formatTsForDisplay(isoString, getSelectedTz());
+    return formatMainDate(isoString, getSelectedTz());
 }
 
 function formatLastTime(firstTs, lastTs) {
     if (!lastTs) return '-';
     const tz = getSelectedTz();
-    
+
     // Format both timestamps in the selected timezone
     const firstDate = new Date(firstTs);
     const lastDate = new Date(lastTs);
-    
+
     const firstParts = new Intl.DateTimeFormat('en-GB', {
         timeZone: tz,
         year: 'numeric',
@@ -539,7 +571,7 @@ function formatLastTime(firstTs, lastTs) {
         minute: '2-digit',
         hour12: false
     }).formatToParts(firstDate);
-    
+
     const lastParts = new Intl.DateTimeFormat('en-GB', {
         timeZone: tz,
         year: 'numeric',
@@ -549,19 +581,19 @@ function formatLastTime(firstTs, lastTs) {
         minute: '2-digit',
         hour12: false
     }).formatToParts(lastDate);
-    
+
     const firstMap = {};
     const lastMap = {};
     firstParts.forEach(p => { firstMap[p.type] = p.value; });
     lastParts.forEach(p => { lastMap[p.type] = p.value; });
-    
+
     const timeStr = `${lastMap.hour}:${lastMap.minute}`;
-    
+
     // Check if different day
     if (firstMap.day !== lastMap.day || firstMap.month !== lastMap.month || firstMap.year !== lastMap.year) {
         return timeStr + '+';
     }
-    
+
     return timeStr;
 }
 
@@ -571,9 +603,20 @@ function formatSessionId(id) {
     return id.slice(9, 13);  // lowercase, no .toUpperCase()
 }
 
-function formatSource(source) {
+function getDisplaySource(row) {
+    const modelRaw = row?.model_raw || '';
+    const source = row?.session_type || '';
+    if (modelRaw.startsWith('claude/') || modelRaw.startsWith('codex_cli/') || source === 'codex_cli') {
+        return 'CLI';
+    }
+    return source || '-';
+}
+
+function formatSource(row) {
+    const source = getDisplaySource(row);
     if (!source) return '-';
     const colors = {
+        'CLI': '#58a6ff',
         'discord': '#5865F2',
         'telegram': '#229ED9',
         'cron': '#d29922',
@@ -584,26 +627,40 @@ function formatSource(source) {
     return `<span class="type-badge" style="background:${color}20;color:${color};border:1px solid ${color}40;">${source}</span>`;
 }
 
+function getDisplayChannel(row) {
+    const modelRaw = row?.model_raw || '';
+    if (modelRaw.startsWith('codex_cli/')) {
+        const label = row?.parent_nickname || '';
+        const labels = {
+            cli: 'terminal',
+            exec: 'exec',
+            vscode: 'VS Code'
+        };
+        return labels[label] || label || 'Codex CLI';
+    }
+    return row?.parent_nickname || row?.channel_name || '-';
+}
+
 // Refresh data (incremental migration + reload)
 async function refreshData() {
     const btn = document.getElementById('refresh-btn');
     const originalText = btn.textContent;
     btn.textContent = '⏳ Updating...';
     btn.disabled = true;
-    
+
     try {
         // Trigger incremental migration
         const refreshResp = await fetch('/api/cost-v3/refresh');
         const refreshData = await refreshResp.json();
-        
+
         if (refreshData.success) {
             console.log('Migration result:', refreshData);
-            
+
             // Reload dashboard data
             await loadData();
-            
+
             // Show toast notification
-            const msg = refreshData.new_sessions > 0 
+            const msg = refreshData.new_sessions > 0
                 ? `✓ Added ${refreshData.new_sessions} new sessions`
                 : '✓ Up to date';
             showToast(msg);
@@ -639,28 +696,34 @@ function showToast(message, type = 'success') {
     setTimeout(() => toast.remove(), 3000);
 }
 
+function buildSessionsApiUrl() {
+    const params = new URLSearchParams();
+    const { startUtc, endUtc } = getActiveTimeWindowUtc();
+    if (startUtc) params.set('start', startUtc);
+    if (endUtc) params.set('end', endUtc);
+    if (hideNoUsageMessages) params.set('usage_only', '1');
+
+    const query = params.toString();
+    return `${COST_API_BASE}/sessions` + (query ? '?' + query : '');
+}
+
 // Fetch data from API
 async function loadData() {
     try {
-        console.log('Fetching data...');
-        const response = await fetch('/api/cost-v3/sessions');
+        const apiUrl = buildSessionsApiUrl();
+        console.log('Fetching data...', apiUrl);
+        const response = await fetch(apiUrl);
         if (!response.ok) throw new Error('API error: ' + response.status);
         const data = await response.json();
         console.log('Data received');
         sessionsData = data.sessions || [];
-        messagesData = data.messages || [];
-
-        // Build message index for fast message-level filtering / aggregation
-        messagesBySessionIdx = {};
-        (messagesData || []).forEach(m => {
-            if (!m || !m.session_id) return;
-            if (!messagesBySessionIdx[m.session_id]) messagesBySessionIdx[m.session_id] = [];
-            messagesBySessionIdx[m.session_id].push(m);
+        sessionsData.forEach(s => {
+            s.src_display = getDisplaySource(s);
+            s.display_channel = getDisplayChannel(s);
         });
-        // Keep timestamps ordered (helps deterministic min/max and any future binary-search)
-        Object.values(messagesBySessionIdx).forEach(arr => {
-            arr.sort((a, b) => (a.timestamp || '').localeCompare(b.timestamp || ''));
-        });
+        messagesData = [];
+        messagesBySegmentCache = {};
+        loadingDetailKeys = new Set();
 
         providerTotals = data.provider_totals || {};
         providerCosts = data.provider_costs || {};
@@ -675,27 +738,27 @@ async function loadData() {
         console.log('Provider totals:', providerTotals);
         console.log('Provider cost periods:', providerCostPeriods);
         console.log('Period pools:', periodPools);
-        
+
         try {
             document.getElementById('generated-time').textContent = new Date().toISOString().slice(0, 19).replace('T', ' ');
         } catch (e) { console.error('Error setting generated-time:', e); }
-        
+
         try {
             populateFilters();
             console.log('Filters populated');
         } catch (e) { console.error('Error in populateFilters:', e); throw e; }
-        
+
         try {
             updateTotals();
             console.log('Totals updated');
         } catch (e) { console.error('Error in updateTotals:', e); throw e; }
-        
+
         try {
             renderTable();
             updateGroupIndicators();
             console.log('Table rendered');
         } catch (e) { console.error('Error in renderTable:', e); throw e; }
-        
+
     } catch (error) {
         console.error('Load error:', error);
         tbody.innerHTML = `<tr><td colspan="21" class="error">Error: ${error.message}</td></tr>`;
@@ -756,90 +819,10 @@ function rowPassesNonTimeFilters(s) {
     return true;
 }
 
-function buildWindowedSegmentRow(seg, startUtc, endUtc) {
-    // Fast overlap check using the segment bounds
-    const segStart = seg.first_msg_ts || seg.created_at;
-    const segEnd = seg.last_msg_ts || segStart;
-    if (startUtc && segEnd && segEnd < startUtc) return null;
-    if (endUtc && segStart && segStart > endUtc) return null;
-
-    const msgs = (messagesBySessionIdx[seg.session_id] || []).filter(m => {
-        if (!m) return false;
-        if (seg.model_raw && m.model_raw !== seg.model_raw) return false;
-
-        // Keep messages within the segment's original bounds (so segments remain meaningful)
-        if (seg.first_msg_ts && m.timestamp < seg.first_msg_ts) return false;
-        if (seg.last_msg_ts && m.timestamp > seg.last_msg_ts) return false;
-
-        // Apply the UI time window at the *message* level
-        if (startUtc && m.timestamp < startUtc) return false;
-        if (endUtc && m.timestamp > endUtc) return false;
-
-        return true;
-    });
-
-    if (msgs.length === 0) return null;
-
-    let input = 0, output = 0, cacheR = 0, cacheW = 0, totalTokens = 0;
-    let costIn = 0, costOut = 0, costCacheR = 0, costCacheW = 0, costTotal = 0;
-
-    let firstTs = null;
-    let lastTs = null;
-
-    msgs.forEach(m => {
-        input += m.input_tokens || 0;
-        output += m.output_tokens || 0;
-        cacheR += m.cache_read || 0;
-        cacheW += m.cache_write || 0;
-        totalTokens += m.total_tokens || 0;
-
-        costIn += m.cost_input || 0;
-        costOut += m.cost_output || 0;
-        costCacheR += m.cost_cache_read || 0;
-        costCacheW += m.cost_cache_write || 0;
-        costTotal += m.cost_total || 0;
-
-        if (m.timestamp && (!firstTs || m.timestamp < firstTs)) firstTs = m.timestamp;
-        if (m.timestamp && (!lastTs || m.timestamp > lastTs)) lastTs = m.timestamp;
-    });
-
-    return {
-        ...seg,
-        // Windowed time bounds
-        first_msg_ts: firstTs,
-        last_msg_ts: lastTs,
-
-        // Windowed aggregates
-        msg_count: msgs.length,
-        input_tokens: input,
-        output_tokens: output,
-        cache_read: cacheR,
-        cache_write: cacheW,
-        total_in: input + cacheR + cacheW,
-        total_tokens: totalTokens,
-        cost_io: costIn + costOut,
-        cost_cache: costCacheR + costCacheW,
-        cost_logged: costTotal,
-    };
-}
-
 function getFilteredData() {
-    const { timeFilteringOn, startUtc, endUtc } = getActiveTimeWindowUtc();
-
-    // If no time window is set, use the pre-aggregated segment rows from the API.
-    if (!timeFilteringOn) {
-        return sessionsData.filter(s => rowPassesNonTimeFilters(s));
-    }
-
-    // Message-level time filtering: slice messages first, then re-aggregate rows.
-    const out = [];
-    (sessionsData || []).forEach(seg => {
-        if (!rowPassesNonTimeFilters(seg)) return;
-        const windowed = buildWindowedSegmentRow(seg, startUtc, endUtc);
-        if (windowed) out.push(windowed);
-    });
-
-    return out;
+    // v3.1 gets any time-window reaggregation from the server, so the browser
+    // only applies non-time/header filters here.
+    return sessionsData.filter(s => rowPassesNonTimeFilters(s));
 }
 
 // Filter dropdown functions (Excel-like)
@@ -860,11 +843,11 @@ function updateGroupIndicators() {
 
 function openFilter(key) {
     closeFilterMenus();
-    
+
     // Get unique values for this column
     const allValues = [...new Set(sessionsData.map(s => s[key]).filter(Boolean))].sort();
     const selected = headerFilters[key] ? new Set(headerFilters[key]) : new Set(allValues);
-    
+
     // Create dropdown
     const menu = document.createElement('div');
     menu.className = 'filter-menu';
@@ -889,10 +872,10 @@ function openFilter(key) {
         </div>
     `;
     document.body.appendChild(menu);
-    
+
     // Prevent clicks inside menu from triggering document close handler
     menu.addEventListener('click', e => e.stopPropagation());
-    
+
     // Position near the clicked button, but keep within viewport
     const btn = document.querySelector(`[data-filter="${key}"]`);
     const rect = btn.getBoundingClientRect();
@@ -901,22 +884,22 @@ function openFilter(key) {
     const searchHeight = 35;
     const buttonsHeight = 40;
     const padding = 16;
-    
+
     // Calculate max available height
     let top = rect.bottom + 4;
     let maxHeight = viewportHeight - top - padding;
-    
+
     if (maxHeight < 150) {
         // Not enough space below, show above
         top = padding;
         maxHeight = rect.top - padding - padding;
     }
-    
+
     menu.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - 260))}px`;
     menu.style.top = `${top}px`;
     menu.style.maxHeight = `${maxHeight}px`;
     menu.querySelector('.items').style.maxHeight = `${maxHeight - searchHeight - buttonsHeight}px`;
-    
+
     // Render items
     const itemsDiv = menu.querySelector('#filter-items');
     const render = (query = '') => {
@@ -940,7 +923,7 @@ function openFilter(key) {
             renderTable();
         };
     }
-    
+
     // Event handlers
     menu.querySelector('#filter-search').oninput = e => render(e.target.value);
     menu.querySelector('#filter-all').onclick = e => { e.stopPropagation(); selected.clear(); allValues.forEach(v => selected.add(v)); render(menu.querySelector('#filter-search').value); };
@@ -970,7 +953,7 @@ function openFilter(key) {
         renderTable();
         closeFilterMenus();
     };
-    
+
     // Close on outside click
     setTimeout(() => {
         const closeHandler = (ev) => {
@@ -993,13 +976,13 @@ function tzLocalToUtcIso(dateStr, timeStr, tz) {
 
 function updateTotals() {
     const filtered = getFilteredData();
-    
+
     // Calculate totals
     let totalInput = 0, totalCacheRead = 0, totalCacheWrite = 0, totalIn = 0;
     let totalOutput = 0, totalTokens = 0, totalCostIO = 0, totalCostCache = 0;
     let totalCost = 0, totalCostEst = 0;
     let totalRequests = 0;
-    
+
     filtered.forEach(s => {
         totalRequests += s.msg_count || 0;
         totalInput += s.input_tokens || 0;
@@ -1013,7 +996,7 @@ function updateTotals() {
         totalCost += s.cost_logged || 0;
         totalCostEst += calculateCostEst(s);
     });
-    
+
     // Update display in table header row
     document.getElementById('total-sessions').textContent = filtered.length.toLocaleString();
     document.getElementById('total-requests').textContent = totalRequests.toLocaleString();
@@ -1213,6 +1196,8 @@ function buildGroupedRows(rows) {
                 filename: null,
                 channel_name: null,
                 parent_nickname: null,
+                display_channel: null,
+                src_display: null,
                 session_type: null,
                 endpoint: doEndpoint ? (r.endpoint || '-') : '-',
                 model: doModel ? (r.model || r.model_raw || '-') : '-',
@@ -1264,11 +1249,50 @@ function buildGroupedRows(rows) {
     return Array.from(groups.values());
 }
 
+function getDetailCacheKey(row, rowId) {
+    const { startUtc, endUtc } = getActiveTimeWindowUtc();
+    return [
+        rowId,
+        startUtc || '',
+        endUtc || '',
+        hideNoUsageMessages ? 'usage' : 'all'
+    ].join('|');
+}
+
+async function loadSegmentMessages(row, rowId, cacheKey) {
+    if (!row || !row.session_id || !row.model_raw || row.segment_index === undefined) return;
+    if (messagesBySegmentCache[cacheKey] || loadingDetailKeys.has(cacheKey)) return;
+
+    loadingDetailKeys.add(cacheKey);
+    try {
+        const params = new URLSearchParams();
+        const { startUtc, endUtc } = getActiveTimeWindowUtc();
+        params.set('session_id', row.session_id);
+        params.set('model_raw', row.model_raw);
+        params.set('segment_index', row.segment_index);
+        if (startUtc) params.set('start', startUtc);
+        if (endUtc) params.set('end', endUtc);
+        if (hideNoUsageMessages) params.set('usage_only', '1');
+
+        const resp = await fetch(`${COST_API_BASE}/messages?${params.toString()}`);
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const data = await resp.json();
+        messagesBySegmentCache[cacheKey] = (data.messages || [])
+            .sort((a, b) => (a.timestamp || '').localeCompare(b.timestamp || ''));
+    } catch (e) {
+        console.error('Detail load failed:', e);
+        messagesBySegmentCache[cacheKey] = { error: e.message || String(e) };
+    } finally {
+        loadingDetailKeys.delete(cacheKey);
+        renderTable();
+    }
+}
+
 function renderTable() {
     const baseFiltered = getFilteredData();
     const isGrouped = !!groupBy.endpoint || !!groupBy.model;
     const filtered = isGrouped ? buildGroupedRows(baseFiltered) : baseFiltered;
-    
+
     // Sort
     // Default view (no sort selected): LAST desc (recent-first)
     const activeSortCol = sortColumn || 'last_msg_ts';
@@ -1298,15 +1322,12 @@ function renderTable() {
         bVal = String(bVal);
         return activeSortDir === 'asc' ? aVal.localeCompare(bVal) : bVal.localeCompare(aVal);
     });
-    
+
     if (filtered.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="22" style="color: var(--text-muted); text-align: center; padding: 20px;">No sessions match filters</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="21" style="color: var(--text-muted); text-align: center; padding: 20px;">No sessions match filters</td></tr>';
         return;
     }
-    
-    // Messages are indexed in messagesBySessionIdx (built in loadData)
-    const messagesBySession = messagesBySessionIdx || {};
-    
+
     const rows = [];
     filtered.forEach(s => {
         const filename = s.filename || '';
@@ -1323,31 +1344,27 @@ function renderTable() {
             statusIcon = `<span class="trash-icon" title="${t}">🗑️</span>`;
         }
 
+        const sessionLogUrl = (!isGrouped && s.session_id) ? `/session-log/${encodeURIComponent(s.session_id)}` : '';
         const rowId = isGrouped ? s.session_id : `${s.session_id}__${s.model_raw}__${s.segment_index}`;
         const isExpanded = (!isGrouped) && expandedSessions.has(rowId);
         const expanderHtml = isGrouped ? '' : `<span class="expander" onclick="toggleDetails(event, '${rowId}')">${isExpanded ? '[-]' : '[+]'}</span>`;
-        const sessionLabel = s.session_nickname || formatSessionId(s.session_id);
-        const sessionTitle = filename || s.session_id || '-';
-        const sessionLink = (!isGrouped && s.session_id)
-            ? `<a href="/session-log/${encodeURIComponent(s.session_id)}" class="id-link" target="_blank" rel="noopener" title="Open raw session log: ${sessionTitle}">${sessionLabel}</a>`
-            : `<span class="id-link" title="${sessionTitle}">${sessionLabel}</span>`;
-        
+
         const costEst = isGrouped ? (s.cost_estimated || 0) : calculateCostEst(s);
         const mtok = (s.total_tokens || 0) / 1e6;
         const costPerMtokLogged = mtok > 0 ? ((s.cost_logged || 0) / mtok) : null;
         const costPerMtokEst = mtok > 0 ? (costEst / mtok) : null;
+        const displayChannel = getDisplayChannel(s);
 
         // Session row
         rows.push(`
-        <tr class="session-row" data-rowid="${rowId}">
+        <tr class="session-row" data-rowid="${rowId}" data-session-log-url="${sessionLogUrl}">
             <td class="date" style="padding-left: 4px; width: 20px;">${expanderHtml}</td>
             <td class="date" style="padding-right: 2px;">${formatDate(s.first_msg_ts || s.created_at)}</td>
             <td class="date" style="color: var(--text-muted); padding-left: 2px;">${formatLastTime(s.first_msg_ts || s.created_at, s.last_msg_ts)}</td>
             <td class="num" style="width: 30px;">${s.msg_count || 0}</td>
-            <td class="id-cell" style="width: 36px;">${sessionLink}${statusIcon}</td>
-            <td>${formatSource(s.session_type)}</td>
-            <td class="channel" title="${s.channel_name || ''}">${s.channel_name || '-'}</td>
-            <td class="label" title="${s.parent_nickname || ''}">${s.parent_nickname || '-'}</td>
+            <td class="id-cell" style="width: 36px;"><a href="#" class="id-link" title="${filename || s.session_id || '-'}">${s.session_nickname || formatSessionId(s.session_id)}</a>${statusIcon}</td>
+            <td>${formatSource(s)}</td>
+            <td class="channel" title="${displayChannel}">${displayChannel}</td>
             <td class="endpoint">${s.endpoint || '-'}</td>
             <td class="model">${s.model || '-'}</td>
             <td class="num">${formatTokens(s.input_tokens)}</td>
@@ -1364,17 +1381,39 @@ function renderTable() {
             <td class="num cost">${formatCostPerMtok(costPerMtokEst)}</td>
         </tr>
         `);
-        
+
         // Detail rows (messages) if expanded
         if (isExpanded) {
-            const sessionMsgs = (messagesBySession[s.session_id] || [])
-                .filter(m => m.model_raw === s.model_raw && m.timestamp >= s.first_msg_ts && m.timestamp <= s.last_msg_ts)
-                .sort((a, b) => (b.timestamp || '').localeCompare(a.timestamp || ''));  // Reverse chrono
+            const detailKey = getDetailCacheKey(s, rowId);
+            const cached = messagesBySegmentCache[detailKey];
+            if (!cached) {
+                rows.push(`
+                <tr class="detail-row" data-parent="${rowId}" style="background: rgba(88, 166, 255, 0.03);">
+                    <td colspan="21" style="padding-left: 24px; color: var(--text-muted); font-size: 11px;">Loading messages...</td>
+                </tr>
+                `);
+                loadSegmentMessages(s, rowId, detailKey);
+            } else if (cached.error) {
+                rows.push(`
+                <tr class="detail-row" data-parent="${rowId}" style="background: rgba(248, 81, 73, 0.08);">
+                    <td colspan="21" style="padding-left: 24px; color: var(--red); font-size: 11px;">Message load failed: ${cached.error}</td>
+                </tr>
+                `);
+            } else if (cached.length === 0) {
+                rows.push(`
+                <tr class="detail-row" data-parent="${rowId}" style="background: rgba(88, 166, 255, 0.03);">
+                    <td colspan="21" style="padding-left: 24px; color: var(--text-muted); font-size: 11px;">No messages in this segment/window</td>
+                </tr>
+                `);
+            } else {
+                const sessionMsgs = cached
+                    .filter(m => !hideNoUsageMessages || messageHasUsage(m))
+                    .sort((a, b) => (b.timestamp || '').localeCompare(a.timestamp || ''));  // Reverse chrono
             sessionMsgs.forEach(m => {
                 const msgDate = formatTsForDisplay(m.timestamp, getSelectedTz());
                 rows.push(`
                 <tr class="detail-row" data-parent="${rowId}" style="display: ; background: rgba(88, 166, 255, 0.03);">
-                    <td colspan="10" style="padding-left: 24px; color: var(--text-muted); font-size: 11px;">
+                    <td colspan="9" style="padding-left: 24px; color: var(--text-muted); font-size: 11px;">
                         ↳ ${msgDate}  —  ${m.model_raw || '-'}
                     </td>
                     <td class="num" style="color: var(--text-muted);">${formatTokens(m.input_tokens)}</td>
@@ -1392,17 +1431,29 @@ function renderTable() {
                 </tr>
                 `);
             });
+            }
         }
     });
-    
+
     tbody.innerHTML = rows.join('');
     updateGroupIndicators();
+
+    // Add click handlers for opening session files
+    document.querySelectorAll('.id-link').forEach(a => {
+        a.addEventListener('click', (ev) => {
+            ev.preventDefault();
+            const tr = ev.target.closest('tr');
+            const url = (tr && tr.dataset) ? tr.dataset.sessionLogUrl : '';
+            if (!url) return;
+            window.open(url, '_blank', 'noopener');
+        });
+    });
 }
 
 function toggleDetails(event, rowId) {
     event.preventDefault();
     event.stopPropagation();
-    
+
     if (expandedSessions.has(rowId)) {
         expandedSessions.delete(rowId);
     } else {
@@ -1412,11 +1463,16 @@ function toggleDetails(event, rowId) {
 }
 
 // Event handlers
-dateStart.addEventListener('change', e => { updateTotals(); renderTable(); });
-dateEnd.addEventListener('change', e => { updateTotals(); renderTable(); });
-timeStart.addEventListener('change', e => { updateTotals(); renderTable(); });
-timeEnd.addEventListener('change', e => { updateTotals(); renderTable(); });
+dateStart.addEventListener('change', e => { loadData(); });
+dateEnd.addEventListener('change', e => { loadData(); });
+timeStart.addEventListener('change', e => { loadData(); });
+timeEnd.addEventListener('change', e => { loadData(); });
 tokenDisplaySelect.addEventListener('change', e => { tokenDisplay = e.target.value; localStorage.setItem('costTrackerTokenDisplay', tokenDisplay); updateTotals(); renderTable(); });
+hideNoUsageMessagesInput.addEventListener('change', e => {
+    hideNoUsageMessages = e.target.checked;
+    localStorage.setItem('costTrackerHideNoUsageMessages', String(hideNoUsageMessages));
+    loadData();
+});
 
 function clearFilters() {
     // Restore *default view* (same as initial page load)
@@ -1429,6 +1485,9 @@ function clearFilters() {
     filters = { dateStart: null, dateEnd: null, endpoint: '', author: '', model: '', channel: '' };
     headerFilters = {};                 // Clear column header filters
     groupBy = { endpoint: false, model: false }; // Clear grouping
+    hideNoUsageMessages = true;
+    if (hideNoUsageMessagesInput) hideNoUsageMessagesInput.checked = true;
+    localStorage.setItem('costTrackerHideNoUsageMessages', 'true');
 
     // Reset sorting to "off" state (default sort is LAST desc)
     sortColumn = '';
@@ -1440,8 +1499,7 @@ function clearFilters() {
     // Reset grouped header styles
     document.querySelectorAll('th.group-on').forEach(th => th.classList.remove('group-on'));
 
-    updateTotals();
-    renderTable();
+    loadData();
 }
 
 // 3-state sort toggle for column headers

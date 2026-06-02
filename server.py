@@ -10,7 +10,7 @@ import sys
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from socketserver import ThreadingMixIn
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 import socketserver
 
 ROOT = Path(__file__).resolve().parent
@@ -22,6 +22,7 @@ DEFAULT_REF_EXPORT_SCRIPT = ROOT / 'ref_export.py'
 DEFAULT_REF_IMPORT_SCRIPT = ROOT / 'ref_import.py'
 DEFAULT_BACKUPS_DIR = ROOT / 'backups'
 DEFAULT_SESSIONS_DIR = Path.home() / '.openclaw' / 'agents' / 'main' / 'sessions'
+DEFAULT_CODEX_SESSIONS_DIR = Path.home() / '.codex' / 'sessions'
 VALID_REF_TABLES = {'provider_costs', 'model_reference', 'provider_pru_invoices'}
 
 
@@ -36,9 +37,35 @@ def parse_args():
     ap.add_argument('--ref-export-script', default=str(DEFAULT_REF_EXPORT_SCRIPT))
     ap.add_argument('--ref-import-script', default=str(DEFAULT_REF_IMPORT_SCRIPT))
     ap.add_argument('--sessions-dir', default=str(DEFAULT_SESSIONS_DIR), help='OpenClaw session log directory used by the refresh endpoint')
+    ap.add_argument('--codex-sessions-dir', default=str(DEFAULT_CODEX_SESSIONS_DIR), help='Codex CLI session log directory used by the refresh endpoint')
     ap.add_argument('--channel-mapping', default=None, help='Optional JSON channel-mapping file passed through to migrate_sessions.py')
     ap.add_argument('--backups-dir', default=str(DEFAULT_BACKUPS_DIR), help='Backup directory passed through to migrate_sessions.py')
     return ap.parse_args()
+
+
+def resolve_session_log_path(filename: str, openclaw_dir: Path, codex_dir: Path):
+    if not filename:
+        return None
+    if filename.startswith('codex_cli:'):
+        rel = filename.split(':', 1)[1]
+        if not rel:
+            return None
+        root = codex_dir.resolve()
+        file_path = (root / rel).resolve()
+        try:
+            file_path.relative_to(root)
+        except ValueError:
+            return None
+        return file_path if file_path.is_file() else None
+    if Path(filename).name != filename:
+        return None
+    root = openclaw_dir.resolve()
+    file_path = (root / filename).resolve()
+    try:
+        file_path.relative_to(root)
+    except ValueError:
+        return None
+    return file_path if file_path.is_file() else None
 
 
 class TrackerHTTPServer(ThreadingMixIn, socketserver.TCPServer):
@@ -92,8 +119,11 @@ class TrackerHandler(BaseHTTPRequestHandler):
         if path.startswith('/session-log/'):
             self.handle_session_log(unquote(path[len('/session-log/'):]))
             return
-        if path == '/api/cost-v3/sessions':
+        if path in ('/api/cost-v3/sessions', '/api/cost-v31/sessions'):
             self.handle_sessions()
+            return
+        if path == '/api/cost-v31/messages':
+            self.handle_messages(parsed)
             return
         if path == '/api/cost-v3/refresh':
             self.handle_refresh()
@@ -149,19 +179,12 @@ class TrackerHandler(BaseHTTPRequestHandler):
             conn.close()
 
         filename = row['filename'] if row else None
-        if not filename or Path(filename).name != filename:
+        if not filename:
             self._respond(404, 'Session log not found\n')
             return
 
-        sessions_dir = self.cfg['sessions_dir'].resolve()
-        file_path = (sessions_dir / filename).resolve()
-        try:
-            file_path.relative_to(sessions_dir)
-        except ValueError:
-            self._respond(404, 'Session log not found\n')
-            return
-
-        if not file_path.is_file():
+        file_path = resolve_session_log_path(filename, self.cfg['sessions_dir'], self.cfg['codex_sessions_dir'])
+        if not file_path:
             self._respond(404, 'Session log not found\n')
             return
 
@@ -171,7 +194,10 @@ class TrackerHandler(BaseHTTPRequestHandler):
             self._respond(500, f'Failed to read session log: {exc}\n')
             return
 
-        safe_filename = filename.replace('"', '')
+        if filename.startswith('codex_cli:'):
+            safe_filename = Path(filename.split(':', 1)[1]).name.replace('"', '')
+        else:
+            safe_filename = filename.replace('"', '')
         self._respond(
             200,
             body,
@@ -179,13 +205,109 @@ class TrackerHandler(BaseHTTPRequestHandler):
             headers={'Content-Disposition': f'inline; filename="{safe_filename}"'},
         )
 
+    def _metadata_payload(self, conn):
+        provider_totals_raw = {
+            row['raw_provider']: row['total_tokens']
+            for row in conn.execute(
+                """
+                SELECT
+                    CASE
+                        WHEN instr(seg.model_raw, '/') > 0 THEN substr(seg.model_raw, 1, instr(seg.model_raw, '/') - 1)
+                        ELSE seg.model_raw
+                    END AS raw_provider,
+                    SUM(seg.total_tokens) AS total_tokens
+                FROM segments seg
+                GROUP BY raw_provider
+                """
+            ).fetchall()
+        }
+        provider_prus_raw = {
+            row['raw_provider']: row['total_prus']
+            for row in conn.execute(
+                """
+                SELECT
+                    CASE
+                        WHEN instr(seg.model_raw, '/') > 0 THEN substr(seg.model_raw, 1, instr(seg.model_raw, '/') - 1)
+                        ELSE seg.model_raw
+                    END AS raw_provider,
+                    SUM(seg.total_tokens * COALESCE(mr.pru_multiplier, 1.0)) AS total_prus
+                FROM segments seg
+                LEFT JOIN model_reference mr ON seg.model_raw = mr.model_raw
+                GROUP BY raw_provider
+                """
+            ).fetchall()
+        }
+        provider_aliases = {
+            'kimi-coding': 'kimi-code',
+            'ollama-cloud': 'opencode',
+        }
+        provider_totals = {}
+        for raw_provider, tokens in provider_totals_raw.items():
+            provider = provider_aliases.get(raw_provider, raw_provider)
+            provider_totals[provider] = provider_totals.get(provider, 0) + (tokens or 0)
+        provider_total_prus = {}
+        for raw_provider, prus in provider_prus_raw.items():
+            provider = provider_aliases.get(raw_provider, raw_provider)
+            provider_total_prus[provider] = provider_total_prus.get(provider, 0) + (prus or 0)
+
+        tier_row = conn.execute(
+            """
+            SELECT
+                SUM(CASE WHEN seg.model_raw LIKE '%opus%' THEN seg.total_tokens ELSE 0 END) AS opus_tokens,
+                SUM(CASE WHEN seg.model_raw LIKE '%opus%' THEN 0 ELSE seg.total_tokens END) AS other_tokens,
+                SUM(CASE WHEN seg.model_raw LIKE '%opus%' THEN 0 ELSE seg.total_tokens * COALESCE(mr.pru_multiplier, 1.0) END) AS other_prus
+            FROM segments seg
+            LEFT JOIN model_reference mr ON seg.model_raw = mr.model_raw
+            WHERE seg.model_raw LIKE 'github-copilot/%'
+            """
+        ).fetchone()
+
+        provider_cost_rows = [dict(row) for row in conn.execute('SELECT * FROM provider_costs ORDER BY provider, billing_start').fetchall()]
+        provider_costs = {}
+        provider_cost_periods = {}
+        for row in provider_cost_rows:
+            provider_costs[row['provider']] = row
+            provider_cost_periods.setdefault(row['provider'], []).append(row)
+
+        return {
+            'provider_totals': provider_totals,
+            'provider_costs': provider_costs,
+            'provider_cost_periods': provider_cost_periods,
+            'provider_total_prus': provider_total_prus,
+            'copilot_opus_tokens': tier_row['opus_tokens'] if tier_row else 0,
+            'copilot_other_tokens': tier_row['other_tokens'] if tier_row else 0,
+            'copilot_other_prus': tier_row['other_prus'] if tier_row else 0,
+        }
+
     def handle_sessions(self):
+        params = parse_qs(urlparse(self.path).query)
         conn = self._db()
         if not conn:
             self._json(500, {'error': f'Database not found: {self.cfg["db"]}'})
             return
         try:
-            sessions_query = """
+            start = (params.get('start') or [None])[0]
+            end = (params.get('end') or [None])[0]
+            usage_only = ((params.get('usage_only') or [''])[0].lower() in ('1', 'true', 'yes'))
+
+            where = []
+            args = []
+            if start:
+                where.append("COALESCE(seg.last_msg_ts, seg.first_msg_ts) >= ?")
+                args.append(start)
+            if end:
+                where.append("COALESCE(seg.first_msg_ts, seg.last_msg_ts) <= ?")
+                args.append(end)
+            if usage_only:
+                where.append("""(
+                    COALESCE(seg.input_tokens, 0) > 0 OR
+                    COALESCE(seg.output_tokens, 0) > 0 OR
+                    COALESCE(seg.cache_read, 0) > 0 OR
+                    COALESCE(seg.cache_write, 0) > 0 OR
+                    COALESCE(seg.total_tokens, 0) > 0
+                )""")
+            where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+            sessions_query = f"""
                 SELECT
                     s.session_id,
                     s.session_nickname,
@@ -216,15 +338,86 @@ class TrackerHandler(BaseHTTPRequestHandler):
                 FROM sessions s
                 INNER JOIN segments seg ON s.session_id = seg.session_id
                 LEFT JOIN model_reference mr ON seg.model_raw = mr.model_raw
+                {where_sql}
                 ORDER BY seg.first_msg_ts DESC
             """
             sessions = []
-            for row in conn.execute(sessions_query).fetchall():
+            for row in conn.execute(sessions_query, args).fetchall():
                 item = dict(row)
                 item['cost_estimated'] = row['cost_logged'] or 0
                 sessions.append(item)
 
-            messages_query = """
+            payload = {'sessions': sessions}
+            payload.update(self._metadata_payload(conn))
+            self._json(200, payload)
+        finally:
+            conn.close()
+
+    def handle_messages(self, parsed):
+        params = parse_qs(parsed.query)
+        session_id = (params.get('session_id') or [''])[0]
+        model_raw = (params.get('model_raw') or [''])[0]
+        segment_index_raw = (params.get('segment_index') or [''])[0]
+        start = (params.get('start') or [None])[0]
+        end = (params.get('end') or [None])[0]
+        usage_only = ((params.get('usage_only') or [''])[0].lower() in ('1', 'true', 'yes'))
+
+        if not session_id or not model_raw or segment_index_raw == '':
+            self._json(400, {'error': 'Missing session_id, model_raw, or segment_index'})
+            return
+
+        try:
+            segment_index = int(segment_index_raw)
+        except ValueError:
+            self._json(400, {'error': 'Invalid segment_index'})
+            return
+
+        conn = self._db()
+        if not conn:
+            self._json(500, {'error': f'Database not found: {self.cfg["db"]}'})
+            return
+
+        try:
+            seg = conn.execute(
+                """
+                SELECT first_msg_ts, last_msg_ts
+                FROM segments
+                WHERE session_id = ? AND model_raw = ? AND segment_index = ?
+                """,
+                (session_id, model_raw, segment_index),
+            ).fetchone()
+            if not seg:
+                self._json(404, {'error': 'Segment not found'})
+                return
+
+            where = [
+                "m.session_id = ?",
+                "mr.model_raw = ?",
+                "m.timestamp >= ?",
+                "m.timestamp <= ?",
+            ]
+            args = [
+                session_id,
+                model_raw,
+                seg['first_msg_ts'],
+                seg['last_msg_ts'] or seg['first_msg_ts'],
+            ]
+            if start:
+                where.append("m.timestamp >= ?")
+                args.append(start)
+            if end:
+                where.append("m.timestamp <= ?")
+                args.append(end)
+            if usage_only:
+                where.append("""(
+                    COALESCE(m.input_tokens, 0) > 0 OR
+                    COALESCE(m.output_tokens, 0) > 0 OR
+                    COALESCE(m.cache_read, 0) > 0 OR
+                    COALESCE(m.cache_write, 0) > 0 OR
+                    COALESCE(m.total_tokens, 0) > 0
+                )""")
+
+            messages_query = f"""
                 SELECT
                     m.id, m.session_id, m.parent_id, m.timestamp,
                     CASE
@@ -236,84 +429,11 @@ class TrackerHandler(BaseHTTPRequestHandler):
                     m.cost_input, m.cost_output, m.cost_cache_read, m.cost_cache_write, m.cost_total
                 FROM messages m
                 INNER JOIN model_reference mr ON mr.id = m.model_ref_id
+                WHERE {" AND ".join(where)}
                 ORDER BY m.timestamp ASC
             """
-            messages = [dict(row) for row in conn.execute(messages_query).fetchall()]
-
-            provider_totals_raw = {
-                row['raw_provider']: row['total_tokens']
-                for row in conn.execute(
-                    """
-                    SELECT
-                        CASE
-                            WHEN instr(seg.model_raw, '/') > 0 THEN substr(seg.model_raw, 1, instr(seg.model_raw, '/') - 1)
-                            ELSE seg.model_raw
-                        END AS raw_provider,
-                        SUM(seg.total_tokens) AS total_tokens
-                    FROM segments seg
-                    GROUP BY raw_provider
-                    """
-                ).fetchall()
-            }
-            provider_prus_raw = {
-                row['raw_provider']: row['total_prus']
-                for row in conn.execute(
-                    """
-                    SELECT
-                        CASE
-                            WHEN instr(seg.model_raw, '/') > 0 THEN substr(seg.model_raw, 1, instr(seg.model_raw, '/') - 1)
-                            ELSE seg.model_raw
-                        END AS raw_provider,
-                        SUM(seg.total_tokens * COALESCE(mr.pru_multiplier, 1.0)) AS total_prus
-                    FROM segments seg
-                    LEFT JOIN model_reference mr ON seg.model_raw = mr.model_raw
-                    GROUP BY raw_provider
-                    """
-                ).fetchall()
-            }
-            provider_aliases = {
-                'kimi-coding': 'kimi-code',
-                'ollama-cloud': 'opencode',
-            }
-            provider_totals = {}
-            for raw_provider, tokens in provider_totals_raw.items():
-                provider = provider_aliases.get(raw_provider, raw_provider)
-                provider_totals[provider] = provider_totals.get(provider, 0) + (tokens or 0)
-            provider_total_prus = {}
-            for raw_provider, prus in provider_prus_raw.items():
-                provider = provider_aliases.get(raw_provider, raw_provider)
-                provider_total_prus[provider] = provider_total_prus.get(provider, 0) + (prus or 0)
-
-            tier_row = conn.execute(
-                """
-                SELECT
-                    SUM(CASE WHEN seg.model_raw LIKE '%opus%' THEN seg.total_tokens ELSE 0 END) AS opus_tokens,
-                    SUM(CASE WHEN seg.model_raw LIKE '%opus%' THEN 0 ELSE seg.total_tokens END) AS other_tokens,
-                    SUM(CASE WHEN seg.model_raw LIKE '%opus%' THEN 0 ELSE seg.total_tokens * COALESCE(mr.pru_multiplier, 1.0) END) AS other_prus
-                FROM segments seg
-                LEFT JOIN model_reference mr ON seg.model_raw = mr.model_raw
-                WHERE seg.model_raw LIKE 'github-copilot/%'
-                """
-            ).fetchone()
-
-            provider_cost_rows = [dict(row) for row in conn.execute('SELECT * FROM provider_costs ORDER BY provider, billing_start').fetchall()]
-            provider_costs = {}
-            provider_cost_periods = {}
-            for row in provider_cost_rows:
-                provider_costs[row['provider']] = row
-                provider_cost_periods.setdefault(row['provider'], []).append(row)
-
-            self._json(200, {
-                'sessions': sessions,
-                'messages': messages,
-                'provider_totals': provider_totals,
-                'provider_costs': provider_costs,
-                'provider_cost_periods': provider_cost_periods,
-                'provider_total_prus': provider_total_prus,
-                'copilot_opus_tokens': tier_row['opus_tokens'] if tier_row else 0,
-                'copilot_other_tokens': tier_row['other_tokens'] if tier_row else 0,
-                'copilot_other_prus': tier_row['other_prus'] if tier_row else 0,
-            })
+            messages = [dict(row) for row in conn.execute(messages_query, args).fetchall()]
+            self._json(200, {'messages': messages})
         finally:
             conn.close()
 
@@ -324,6 +444,7 @@ class TrackerHandler(BaseHTTPRequestHandler):
             '--incremental',
             '--db', str(self.cfg['db']),
             '--sessions-dir', str(self.cfg['sessions_dir']),
+            '--codex-sessions-dir', str(self.cfg['codex_sessions_dir']),
             '--backups-dir', str(self.cfg['backups_dir']),
         ]
         if self.cfg['channel_mapping']:
@@ -440,6 +561,7 @@ def main():
         'ref_export_script': Path(args.ref_export_script).expanduser().resolve(),
         'ref_import_script': Path(args.ref_import_script).expanduser().resolve(),
         'sessions_dir': Path(args.sessions_dir).expanduser().resolve(),
+        'codex_sessions_dir': Path(args.codex_sessions_dir).expanduser().resolve(),
         'channel_mapping': Path(args.channel_mapping).expanduser().resolve() if args.channel_mapping else None,
         'backups_dir': Path(args.backups_dir).expanduser().resolve(),
     }
@@ -447,6 +569,8 @@ def main():
         print(f'AI Cost Tracker server running at http://{args.host}:{args.port}')
         print(f'Database: {config["db"]}')
         print(f'Dashboard: {config["dashboard"]}')
+        print(f'OpenClaw sessions: {config["sessions_dir"]}')
+        print(f'Codex sessions: {config["codex_sessions_dir"]}')
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:

@@ -36,11 +36,11 @@ def main():
     conn = sqlite3.connect(str(db_path))
     try:
         conn.executemany(
-            """
+            '''
             INSERT OR REPLACE INTO provider_pru_invoices
               (provider, cycle_start, cycle_end, model_raw, prus, notes)
             VALUES (?, ?, ?, ?, ?, ?)
-            """,
+            ''',
             rows,
         )
         conn.commit()
