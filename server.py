@@ -116,6 +116,9 @@ class TrackerHandler(BaseHTTPRequestHandler):
         if path in ('/', '/index.html', '/cost/v3'):
             self.serve_dashboard()
             return
+        if path == '/jsonl-viewer':
+            self.serve_jsonl_viewer()
+            return
         if path.startswith('/session-log/'):
             self.handle_session_log(unquote(path[len('/session-log/'):]))
             return
@@ -156,6 +159,13 @@ class TrackerHandler(BaseHTTPRequestHandler):
             self._respond(404, f'Dashboard not found: {dashboard}')
             return
         self._respond(200, dashboard.read_text(encoding='utf-8'), 'text/html; charset=utf-8')
+
+    def serve_jsonl_viewer(self):
+        viewer = Path(__file__).resolve().parent / 'jsonl_viewer.html'
+        if not viewer.exists():
+            self._respond(404, f'JSONL viewer not found: {viewer}')
+            return
+        self._respond(200, viewer.read_text(encoding='utf-8'), 'text/html; charset=utf-8')
 
     def handle_session_log(self, session_id):
         if not session_id:

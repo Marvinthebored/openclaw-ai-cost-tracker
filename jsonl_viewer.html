@@ -1,0 +1,567 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>JSONL Viewer - Marvin's Workshop</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+    <style>
+        :root {
+            --bg: #0d1117;
+            --panel: #161b22;
+            --border: #30363d;
+            --text: #c9d1d9;
+            --muted: #8b949e;
+            --accent: #58a6ff;
+            --red: #f85149;
+            --green: #3fb950;
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            background: #2f3a44;
+            color: var(--text);
+            font-family: "SF Mono", Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+            font-size: 11px;
+            line-height: 1.35;
+            overflow-x: auto;
+        }
+        header {
+            position: sticky;
+            top: 0;
+            z-index: 5;
+            background: var(--panel);
+            border-bottom: 1px solid var(--border);
+            padding: 10px 14px;
+        }
+        h1 {
+            margin: 0 0 6px;
+            font-size: 15px;
+            font-weight: 600;
+        }
+        .toolbar {
+            display: flex;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 14px;
+            color: var(--muted);
+        }
+        label {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            cursor: pointer;
+            user-select: none;
+        }
+        input { accent-color: var(--accent); }
+        button.action,
+        select {
+            border: 1px solid var(--border);
+            background: #21262d;
+            color: var(--text);
+            border-radius: 4px;
+            font: inherit;
+            padding: 3px 7px;
+        }
+        button.action {
+            cursor: pointer;
+        }
+        button.action:hover,
+        select:hover {
+            border-color: var(--accent);
+        }
+        select {
+            max-width: 42vw;
+            min-width: 220px;
+        }
+        .hidden-input {
+            display: none;
+        }
+        #file-label {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            max-width: min(760px, 70vw);
+        }
+        #status {
+            padding: 14px;
+            color: var(--muted);
+        }
+        #status.error { color: var(--red); }
+        #status.ready { color: var(--green); }
+        #viewer {
+            padding: 8px 0 65vh;
+        }
+        #drop-zone {
+            display: none;
+            margin: 14px;
+            border: 1px dashed #6e7681;
+            border-radius: 6px;
+            color: var(--muted);
+            padding: 28px;
+            text-align: center;
+            background: rgba(13, 17, 23, 0.28);
+        }
+        body.local-empty #drop-zone {
+            display: block;
+        }
+        body.drag-active #drop-zone {
+            display: block;
+            border-color: var(--accent);
+            color: var(--text);
+            background: rgba(88, 166, 255, 0.09);
+        }
+        .line {
+            display: grid;
+            grid-template-columns: 56px 14px max-content;
+            border-bottom: 0;
+            min-width: 100%;
+            width: max-content;
+            align-items: start;
+        }
+        .line:hover { background: rgba(88, 166, 255, 0.06); }
+        .toggle {
+            width: 14px;
+            border: 0;
+            background: transparent;
+            color: var(--muted);
+            cursor: pointer;
+            font: inherit;
+            padding: 0;
+            text-align: left;
+            line-height: 1.35;
+        }
+        .toggle:hover { color: var(--accent); }
+        .line-no {
+            color: var(--muted);
+            text-align: right;
+            padding: 0 1ch 0 4px;
+            border-right: 0;
+            user-select: none;
+            line-height: 1.35;
+        }
+        .content {
+            min-width: max-content;
+            padding: 0 8px 0 4px;
+        }
+        .line-text,
+        .json-block {
+            margin: 0;
+            white-space: pre;
+            overflow-x: visible;
+            font: inherit;
+            tab-size: 4;
+        }
+        body.wrap .line {
+            grid-template-columns: 56px 14px minmax(0, 1fr);
+            min-width: 0;
+            width: 100%;
+        }
+        body.wrap .content {
+            min-width: 0;
+        }
+        body.wrap .line-text,
+        body.wrap .json-block {
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+            overflow-x: visible;
+        }
+        .parse-error {
+            color: var(--red);
+            margin-bottom: 4px;
+        }
+        .json-key { color: #64b5f6; }
+        .json-key-depth-0 { color: #64d8dc; }
+        .json-key-depth-1 { color: #c792ea; }
+        .json-key-depth-2 { color: #cfd8dc; }
+        .json-key-depth-3 { color: #64d8dc; }
+        .json-key-depth-4 { color: #ffab70; }
+        .json-key-depth-5 { color: #e58ab7; }
+        .json-string { color: #a5d6a7; }
+        .json-number { color: #f2cc60; }
+        .json-bool { color: #c792ea; }
+        .json-null { color: #ffab70; }
+        .json-punctuation { color: #d7dde5; }
+        .json-line { display: block; }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>JSONL Viewer</h1>
+        <div class="toolbar">
+            <label><input type="checkbox" id="wrap-toggle"> word wrap</label>
+            <button type="button" class="action" id="open-file-button">open local file</button>
+            <button type="button" class="action" id="open-folder-button">open local folder</button>
+            <select id="local-file-select" title="Local files from the last drop or folder pick" disabled>
+                <option>no local files loaded</option>
+            </select>
+            <span id="file-label"></span>
+        </div>
+        <input class="hidden-input" type="file" id="local-file-input" accept=".jsonl,.json,.log,.txt" multiple>
+        <input class="hidden-input" type="file" id="local-folder-input" webkitdirectory directory multiple>
+    </header>
+    <div id="drop-zone">Drop a JSONL log file here, or use "open local folder" to build a pick list.</div>
+    <div id="status">Loading...</div>
+    <main id="viewer"></main>
+
+    <script>
+        const params = new URLSearchParams(window.location.search);
+        const filePath = params.get('path') || '';
+        const fileUrl = params.get('url') || '';
+        const statusEl = document.getElementById('status');
+        const viewerEl = document.getElementById('viewer');
+        const dropZone = document.getElementById('drop-zone');
+        const wrapToggle = document.getElementById('wrap-toggle');
+        const fileLabel = document.getElementById('file-label');
+        const openFileButton = document.getElementById('open-file-button');
+        const openFolderButton = document.getElementById('open-folder-button');
+        const localFileInput = document.getElementById('local-file-input');
+        const localFolderInput = document.getElementById('local-folder-input');
+        const localFileSelect = document.getElementById('local-file-select');
+        let localFiles = [];
+        let currentSource = null;
+
+        function encodeFilePath(path) {
+            return path.split('/').map(part => encodeURIComponent(part)).join('/');
+        }
+
+        function rawFileUrl(path) {
+            return `/files/${encodeFilePath(path)}?raw=1`;
+        }
+
+        function serverSourceUrl() {
+            if (fileUrl) return fileUrl;
+            if (filePath) return rawFileUrl(filePath);
+            return '';
+        }
+
+        function escapeHtml(value) {
+            return value
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;');
+        }
+
+        function keyClassForDepth(depth) {
+            if (depth === null || depth === undefined) return 'json-key';
+            return `json-key json-key-depth-${Math.max(0, depth) % 6}`;
+        }
+
+        function highlightJson(text, keyDepth = null) {
+            const tokenRe = /("(?:\\.|[^"\\])*"(?=\s*:)|"(?:\\.|[^"\\])*"|\btrue\b|\bfalse\b|\bnull\b|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)/g;
+            let out = '';
+            let last = 0;
+            for (const match of text.matchAll(tokenRe)) {
+                const token = match[0];
+                out += escapeHtml(text.slice(last, match.index));
+                let cls = 'json-number';
+                if (token.startsWith('"')) {
+                    const after = text.slice(match.index + token.length);
+                    cls = /^\s*:/.test(after) ? keyClassForDepth(keyDepth) : 'json-string';
+                } else if (token === 'true' || token === 'false') {
+                    cls = 'json-bool';
+                } else if (token === 'null') {
+                    cls = 'json-null';
+                }
+                out += `<span class="${cls}">${escapeHtml(token)}</span>`;
+                last = match.index + token.length;
+            }
+            out += escapeHtml(text.slice(last));
+            return out;
+        }
+
+        function highlightPrettyJson(text) {
+            return text.split('\n').map(line => {
+                const indent = (line.match(/^ */) || [''])[0].length;
+                const depth = Math.floor(indent / 3);
+                return `<span class="json-line">${highlightJson(line, depth)}</span>`;
+            }).join('');
+        }
+
+        function setError(message) {
+            statusEl.className = 'error';
+            statusEl.textContent = message;
+        }
+
+        function setStatus(message, className = '') {
+            statusEl.className = className;
+            statusEl.textContent = message;
+        }
+
+        function clearViewer() {
+            viewerEl.replaceChildren();
+        }
+
+        function isLikelyJsonlLog(file) {
+            const name = file.name || '';
+            return name.endsWith('.jsonl') ||
+                name.includes('.jsonl.') ||
+                name.endsWith('.log') ||
+                name.endsWith('.txt') ||
+                name.endsWith('.json');
+        }
+
+        function localFileLabel(file) {
+            return file.webkitRelativePath || file.relativePath || file.name || 'local file';
+        }
+
+        function setLocalEmptyState(enabled) {
+            document.body.classList.toggle('local-empty', enabled);
+        }
+
+        function makeLine(raw, index) {
+            const row = document.createElement('div');
+            row.className = 'line';
+
+            const toggle = document.createElement('button');
+            toggle.className = 'toggle';
+            toggle.type = 'button';
+            toggle.textContent = '▶';
+            toggle.title = 'Expand line';
+
+            const lineNo = document.createElement('div');
+            lineNo.className = 'line-no';
+            lineNo.textContent = String(index + 1);
+
+            const content = document.createElement('div');
+            content.className = 'content';
+
+            const collapsed = document.createElement('pre');
+            collapsed.className = 'line-text';
+            collapsed.innerHTML = highlightJson(raw);
+            content.appendChild(collapsed);
+
+            let expanded = false;
+            let expandedNode = null;
+
+            toggle.addEventListener('click', () => {
+                expanded = !expanded;
+                toggle.textContent = expanded ? '▼' : '▶';
+                toggle.title = expanded ? 'Collapse line' : 'Expand line';
+
+                if (expanded) {
+                    collapsed.style.display = 'none';
+                    if (!expandedNode) {
+                        expandedNode = document.createElement('div');
+                        try {
+                            const pretty = JSON.stringify(JSON.parse(raw), null, 3);
+                            const block = document.createElement('pre');
+                            block.className = 'json-block';
+                            block.innerHTML = highlightPrettyJson(pretty);
+                            expandedNode.appendChild(block);
+                        } catch (err) {
+                            const error = document.createElement('div');
+                            error.className = 'parse-error';
+                            error.textContent = `JSON parse error: ${err.message}`;
+                            const block = document.createElement('pre');
+                            block.className = 'json-block';
+                            block.innerHTML = highlightJson(raw);
+                            expandedNode.appendChild(error);
+                            expandedNode.appendChild(block);
+                        }
+                    }
+                    content.appendChild(expandedNode);
+                } else {
+                    collapsed.style.display = '';
+                    if (expandedNode && expandedNode.parentNode) {
+                        expandedNode.parentNode.removeChild(expandedNode);
+                    }
+                }
+            });
+
+            row.appendChild(lineNo);
+            row.appendChild(toggle);
+            row.appendChild(content);
+            return row;
+        }
+
+        function renderJsonlText(text, sourceLabel) {
+            currentSource = sourceLabel;
+            fileLabel.textContent = sourceLabel;
+            clearViewer();
+
+            const lines = text.split(/\r?\n/);
+            if (lines.length && lines[lines.length - 1] === '') lines.pop();
+
+            const fragment = document.createDocumentFragment();
+            lines.forEach((line, index) => {
+                fragment.appendChild(makeLine(line, index));
+            });
+
+            viewerEl.appendChild(fragment);
+            setLocalEmptyState(false);
+            setStatus(`${lines.length.toLocaleString()} lines`, 'ready');
+        }
+
+        async function loadServerJsonl() {
+            const sourceUrl = serverSourceUrl();
+            if (!sourceUrl) {
+                setLocalEmptyState(true);
+                fileLabel.textContent = 'local mode';
+                setStatus('Drop a JSONL log file, open one file, or open a folder of logs.');
+                return;
+            }
+
+            const sourceLabel = filePath || fileUrl;
+            fileLabel.textContent = sourceLabel;
+
+            try {
+                const response = await fetch(sourceUrl);
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+                const text = await response.text();
+                renderJsonlText(text, sourceLabel);
+            } catch (err) {
+                setError(`Failed to load JSONL: ${err.message}`);
+            }
+        }
+
+        async function loadLocalFile(file) {
+            if (!file) return;
+            try {
+                setStatus(`Reading ${localFileLabel(file)}...`);
+                const text = await file.text();
+                renderJsonlText(text, `local: ${localFileLabel(file)}`);
+            } catch (err) {
+                setError(`Failed to read local file: ${err.message}`);
+            }
+        }
+
+        function setLocalFiles(files, source = 'local') {
+            localFiles = Array.from(files || [])
+                .filter(isLikelyJsonlLog)
+                .sort((a, b) => localFileLabel(a).localeCompare(localFileLabel(b)));
+
+            localFileSelect.replaceChildren();
+
+            if (!localFiles.length) {
+                const option = document.createElement('option');
+                option.textContent = 'no JSONL-like local files found';
+                localFileSelect.appendChild(option);
+                localFileSelect.disabled = true;
+                setStatus(`No JSONL-like files found in ${source}.`);
+                setLocalEmptyState(true);
+                return;
+            }
+
+            localFiles.forEach((file, index) => {
+                const option = document.createElement('option');
+                option.value = String(index);
+                option.textContent = localFileLabel(file);
+                localFileSelect.appendChild(option);
+            });
+            localFileSelect.disabled = false;
+            setStatus(`${localFiles.length.toLocaleString()} local file${localFiles.length === 1 ? '' : 's'} available.`, 'ready');
+            loadLocalFile(localFiles[0]);
+        }
+
+        function readDirectoryEntries(reader) {
+            return new Promise((resolve, reject) => {
+                const entries = [];
+                function readBatch() {
+                    reader.readEntries(batch => {
+                        if (!batch.length) {
+                            resolve(entries);
+                            return;
+                        }
+                        entries.push(...batch);
+                        readBatch();
+                    }, reject);
+                }
+                readBatch();
+            });
+        }
+
+        async function fileFromEntry(entry, prefix = '') {
+            if (entry.isFile) {
+                return new Promise((resolve, reject) => {
+                    entry.file(file => {
+                        try {
+                            Object.defineProperty(file, 'relativePath', {
+                                value: `${prefix}${file.name}`,
+                                configurable: true
+                            });
+                        } catch (err) {
+                            // Non-fatal: the plain filename still works.
+                        }
+                        resolve([file]);
+                    }, reject);
+                });
+            }
+
+            if (entry.isDirectory) {
+                const children = await readDirectoryEntries(entry.createReader());
+                const nested = await Promise.all(children.map(child => fileFromEntry(child, `${prefix}${entry.name}/`)));
+                return nested.flat();
+            }
+
+            return [];
+        }
+
+        async function filesFromDataTransfer(dataTransfer) {
+            const items = Array.from(dataTransfer.items || []);
+            const entryItems = items
+                .map(item => item.webkitGetAsEntry ? item.webkitGetAsEntry() : null)
+                .filter(Boolean);
+
+            if (entryItems.length) {
+                const nested = await Promise.all(entryItems.map(entry => fileFromEntry(entry)));
+                return nested.flat();
+            }
+
+            return Array.from(dataTransfer.files || []);
+        }
+
+        wrapToggle.addEventListener('change', () => {
+            document.body.classList.toggle('wrap', wrapToggle.checked);
+        });
+
+        openFileButton.addEventListener('click', () => {
+            localFileInput.click();
+        });
+
+        openFolderButton.addEventListener('click', () => {
+            localFolderInput.click();
+        });
+
+        localFileInput.addEventListener('change', event => {
+            setLocalFiles(event.target.files, 'selected files');
+            localFileInput.value = '';
+        });
+
+        localFolderInput.addEventListener('change', event => {
+            setLocalFiles(event.target.files, 'selected folder');
+            localFolderInput.value = '';
+        });
+
+        localFileSelect.addEventListener('change', () => {
+            loadLocalFile(localFiles[Number(localFileSelect.value)]);
+        });
+
+        for (const eventName of ['dragenter', 'dragover']) {
+            window.addEventListener(eventName, event => {
+                event.preventDefault();
+                document.body.classList.add('drag-active');
+            });
+        }
+
+        for (const eventName of ['dragleave', 'drop']) {
+            window.addEventListener(eventName, async event => {
+                event.preventDefault();
+                if (eventName === 'drop') {
+                    setStatus('Reading dropped files...');
+                    try {
+                        setLocalFiles(await filesFromDataTransfer(event.dataTransfer), 'drop');
+                    } catch (err) {
+                        setError(`Failed to read dropped files: ${err.message}`);
+                    }
+                }
+                document.body.classList.remove('drag-active');
+            });
+        }
+
+        loadServerJsonl();
+    </script>
+</body>
+</html>

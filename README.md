@@ -8,7 +8,8 @@ Standalone cost tracker for OpenClaw and Codex CLI session logs.
 - tracks per-message and per-session token usage
 - splits sessions into model segments when the model changes mid-session
 - serves a browser dashboard for filtering, grouping, and estimated cost analysis
-- opens raw OpenClaw session logs in a new browser tab when you click a session entry
+- opens OpenClaw session logs in a JSONL viewer when you click a session entry
+- can inspect local JSONL/log files in the viewer via drag/drop, file picker, or folder picker
 - shows source session-file metadata alongside tracked sessions
 - includes browser download/upload actions for the editable reference TSV tables (`provider_costs`, `model_reference`, `provider_pru_invoices`)
 
@@ -17,6 +18,7 @@ Standalone cost tracker for OpenClaw and Codex CLI session logs.
 - `migrate_sessions.py` — builds / updates the SQLite database from OpenClaw and Codex CLI logs
 - `server.py` — small standalone HTTP server for the dashboard and JSON API
 - `dashboard.html` — browser UI for filtering, grouping, and inspection
+- `jsonl_viewer.html` — JSONL/session-log viewer with server-log and local-file modes
 - `schema.sql` — SQLite schema
 - `ref_export.py`, `ref_import.py`, `import_pru_invoice_csv.py` — helper scripts for reference data
 - `ref/*.tsv` — editable TSV lookup/config tables
@@ -144,12 +146,18 @@ Use this for normal day-to-day refreshes.
   - per-message detail rows when requested
   - provider totals
   - reference-table data used for cost estimation
-- clicking a session entry opens the raw underlying OpenClaw log in a new browser tab for direct browsing
+- clicking a session entry opens the underlying OpenClaw log in the JSONL viewer
 - clicking **Refresh** calls the migration script in incremental mode
 
 ## Raw session log browsing
 
-Session rows link to a public-package web endpoint that serves the matching raw log file directly from the configured OpenClaw or Codex session directory.
+Session rows open `/jsonl-viewer`, which fetches the matching raw log file through the public-package `/session-log/<session_id>` endpoint.
+
+The same viewer can also browse local files without uploading them anywhere:
+
+- drag a `.jsonl` / `.log` / `.txt` file onto the page
+- use **open local file** for one or more files
+- use **open local folder** to build a pick list from a folder of logs
 
 If you run the tracker locally and prefer a different workflow, you can customize that endpoint to launch your preferred editor instead. The default package behavior stays browser-based and platform-agnostic.
 

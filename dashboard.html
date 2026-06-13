@@ -1344,7 +1344,8 @@ function renderTable() {
             statusIcon = `<span class="trash-icon" title="${t}">🗑️</span>`;
         }
 
-        const sessionLogUrl = (!isGrouped && s.session_id) ? `/session-log/${encodeURIComponent(s.session_id)}` : '';
+        const sessionLogRawUrl = (!isGrouped && s.session_id) ? `/session-log/${encodeURIComponent(s.session_id)}` : '';
+        const sessionLogUrl = sessionLogRawUrl ? `/jsonl-viewer?url=${encodeURIComponent(sessionLogRawUrl)}` : '';
         const rowId = isGrouped ? s.session_id : `${s.session_id}__${s.model_raw}__${s.segment_index}`;
         const isExpanded = (!isGrouped) && expandedSessions.has(rowId);
         const expanderHtml = isGrouped ? '' : `<span class="expander" onclick="toggleDetails(event, '${rowId}')">${isExpanded ? '[-]' : '[+]'}</span>`;
