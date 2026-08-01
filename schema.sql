@@ -74,7 +74,14 @@ CREATE TABLE IF NOT EXISTS messages (
     cost_output REAL,
     cost_cache_read REAL,
     cost_cache_write REAL,
-    cost_total REAL
+    cost_total REAL,
+    cost_source TEXT,
+    cost_kind TEXT,
+    cost_is_estimated INTEGER DEFAULT 0,
+    ingest_source TEXT,
+    duplicate_of TEXT,
+    excluded_reason TEXT,
+    is_excluded INTEGER NOT NULL DEFAULT 0
 );
 
 -- PAYG spend tracking (manual entry from console)
@@ -90,6 +97,8 @@ CREATE TABLE IF NOT EXISTS payg_spend (
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
 CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp);
 CREATE INDEX IF NOT EXISTS idx_messages_model_ref ON messages(model_ref_id);
+CREATE INDEX IF NOT EXISTS idx_messages_session_timestamp ON messages(session_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_messages_session_model_timestamp ON messages(session_id, model_ref_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_sessions_channel ON sessions(channel_name);
 CREATE INDEX IF NOT EXISTS idx_sessions_created ON sessions(created_at);
 
@@ -112,11 +121,16 @@ CREATE TABLE IF NOT EXISTS segments (
     cost_cache_read REAL DEFAULT 0,
     cost_cache_write REAL DEFAULT 0,
     cost_total REAL DEFAULT 0,
+    cost_source TEXT,
+    cost_kind TEXT,
+    cost_is_estimated INTEGER DEFAULT 0,
     UNIQUE(session_id, segment_index)
 );
 
 CREATE INDEX IF NOT EXISTS idx_segments_session ON segments(session_id);
 CREATE INDEX IF NOT EXISTS idx_segments_model ON segments(model_raw);
+CREATE INDEX IF NOT EXISTS idx_segments_session_model_idx ON segments(session_id, model_raw, segment_index);
+CREATE INDEX IF NOT EXISTS idx_segments_time_bounds ON segments(first_msg_ts, last_msg_ts);
 
 -- Ingestion state (so the DB can be the archive even if old session logs disappear)
 -- Tracks how much of each session file we've ingested, so incremental runs are append-only.

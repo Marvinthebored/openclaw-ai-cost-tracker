@@ -3,8 +3,8 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>JSONL Viewer - Marvin's Workshop</title>
-    <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+    <title>OpenClaw JSONL Viewer</title>
+    <link rel="icon" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnIHZpZXdCb3g9JzAgMCAzMiAzMic+PHJlY3Qgd2lkdGg9JzMyJyBoZWlnaHQ9JzMyJyByeD0nNicgZmlsbD0nIzE2MWIyMicvPjxwYXRoIGQ9J003LDQuNSBDNCw0LjUgNC41LDggNC41LDExLjUgQzQuNSwxNC41IDIsMTYgLTcsMTYgQzIsMTYgNC41LDE3LjUgNC41LDIwLjUgQzQuNSwyNCA0LDI3LjUgNywyNy41JyBmaWxsPSdub25lJyBzdHJva2U9JyNjOWQxZDknIHN0cm9rZS13aWR0aD0nMi4yJyBzdHJva2UtbGluZWNhcD0ncm91bmQnIHN0cm9rZS1saW5lam9pbj0ncm91bmQnLz48cGF0aCBkPSdNMjUsNC41IEMyOCw0LjUgMjcuNSw4IDI3LjUsMTEuNSBDMjcuNSwxNC41IDMwLDE2IDM5LDE2IEMzMCwxNiAyNy41LDE3LjUgMjcuNSwyMC41IEMyNy41LDI0IDI4LDI3LjUgMjUsMjcuNScgZmlsbD0nbm9uZScgc3Ryb2tlPScjYzlkMWQ5JyBzdHJva2Utd2lkdGg9JzIuMicgc3Ryb2tlLWxpbmVjYXA9J3JvdW5kJyBzdHJva2UtbGluZWpvaW49J3JvdW5kJy8+PHJlY3QgeD0nNy41JyB5PSc5LjcnIHdpZHRoPScxNScgaGVpZ2h0PScyLjYnIHJ4PScxLjMnIGZpbGw9JyM1OGE2ZmYnLz48cmVjdCB4PSc3LjUnIHk9JzE0LjcnIHdpZHRoPScxNycgaGVpZ2h0PScyLjYnIHJ4PScxLjMnIGZpbGw9JyMzZmI5NTAnLz48cmVjdCB4PSc3LjUnIHk9JzE5LjcnIHdpZHRoPScxMScgaGVpZ2h0PScyLjYnIHJ4PScxLjMnIGZpbGw9JyM4Yjk0OWUnLz48L3N2Zz4=" type="image/svg+xml">
     <style>
         :root {
             --bg: #0d1117;
@@ -83,6 +83,19 @@
             white-space: nowrap;
             max-width: min(760px, 70vw);
         }
+        #jump-line {
+            width: 9ch;
+            border: 1px solid var(--border);
+            background: #0d1117;
+            color: var(--text);
+            border-radius: 4px;
+            font: inherit;
+            padding: 3px 6px;
+        }
+        button.action:disabled {
+            opacity: 0.45;
+            cursor: not-allowed;
+        }
         #status {
             padding: 14px;
             color: var(--muted);
@@ -90,7 +103,7 @@
         #status.error { color: var(--red); }
         #status.ready { color: var(--green); }
         #viewer {
-            padding: 8px 0 65vh;
+            padding: 8px 0 calc(10 * 1.35em);
         }
         #drop-zone {
             display: none;
@@ -190,6 +203,19 @@
         <h1>JSONL Viewer</h1>
         <div class="toolbar">
             <label><input type="checkbox" id="wrap-toggle"> word wrap</label>
+            <label>tail
+                <select id="line-limit-select" title="Server-loaded logs are tailed so huge Claude files do not crash the tab">
+                    <option value="500">500 lines</option>
+                    <option value="2000" selected>2,000 lines</option>
+                    <option value="10000">10,000 lines</option>
+                    <option value="20000">20,000 lines</option>
+                </select>
+            </label>
+            <button type="button" class="action" id="prev-slice-button" disabled>older ▲</button>
+            <button type="button" class="action" id="next-slice-button" disabled>newer ▼</button>
+            <button type="button" class="action" id="latest-slice-button" disabled>latest</button>
+            <label>line <input id="jump-line" type="number" min="1" step="1" placeholder="go to"></label>
+            <button type="button" class="action" id="jump-line-button" disabled>go</button>
             <button type="button" class="action" id="open-file-button">open local file</button>
             <button type="button" class="action" id="open-folder-button">open local folder</button>
             <select id="local-file-select" title="Local files from the last drop or folder pick" disabled>
@@ -208,11 +234,19 @@
         const params = new URLSearchParams(window.location.search);
         const filePath = params.get('path') || '';
         const fileUrl = params.get('url') || '';
+        const sid = params.get('sid') || '';
+        const displayPath = params.get('display') || '';
         const statusEl = document.getElementById('status');
         const viewerEl = document.getElementById('viewer');
         const dropZone = document.getElementById('drop-zone');
         const wrapToggle = document.getElementById('wrap-toggle');
         const fileLabel = document.getElementById('file-label');
+        const lineLimitSelect = document.getElementById('line-limit-select');
+        const prevSliceButton = document.getElementById('prev-slice-button');
+        const nextSliceButton = document.getElementById('next-slice-button');
+        const latestSliceButton = document.getElementById('latest-slice-button');
+        const jumpLineInput = document.getElementById('jump-line');
+        const jumpLineButton = document.getElementById('jump-line-button');
         const openFileButton = document.getElementById('open-file-button');
         const openFolderButton = document.getElementById('open-folder-button');
         const localFileInput = document.getElementById('local-file-input');
@@ -220,6 +254,8 @@
         const localFileSelect = document.getElementById('local-file-select');
         let localFiles = [];
         let currentSource = null;
+        let currentSliceMeta = null;
+        const MAX_COLLAPSED_CHARS = 4000;
 
         function encodeFilePath(path) {
             return path.split('/').map(part => encodeURIComponent(part)).join('/');
@@ -229,9 +265,14 @@
             return `/files/${encodeFilePath(path)}?raw=1`;
         }
 
-        function serverSourceUrl() {
+        function serverSourceUrl(startLine = null) {
+            if (sid) return `/api/cost-v4/transcript/${encodeURIComponent(sid)}`;
             if (fileUrl) return fileUrl;
-            if (filePath) return rawFileUrl(filePath);
+            if (filePath) {
+                const qs = new URLSearchParams({ path: filePath, lines: lineLimitSelect.value || '2000' });
+                if (startLine !== null && startLine !== undefined) qs.set('start', String(startLine));
+                return `/api/jsonl-tail?${qs.toString()}`;
+            }
             return '';
         }
 
@@ -309,7 +350,7 @@
             document.body.classList.toggle('local-empty', enabled);
         }
 
-        function makeLine(raw, index) {
+        function makeLine(raw, index, lineNumberBase = 1) {
             const row = document.createElement('div');
             row.className = 'line';
 
@@ -321,14 +362,18 @@
 
             const lineNo = document.createElement('div');
             lineNo.className = 'line-no';
-            lineNo.textContent = String(index + 1);
+            lineNo.textContent = String(lineNumberBase + index);
 
             const content = document.createElement('div');
             content.className = 'content';
 
             const collapsed = document.createElement('pre');
             collapsed.className = 'line-text';
-            collapsed.innerHTML = highlightJson(raw);
+            const rawForCollapsed = raw.length > MAX_COLLAPSED_CHARS
+                ? `${raw.slice(0, MAX_COLLAPSED_CHARS)} … [${(raw.length - MAX_COLLAPSED_CHARS).toLocaleString()} chars hidden; expand to view]`
+                : raw;
+            collapsed.innerHTML = highlightJson(rawForCollapsed);
+            if (rawForCollapsed !== raw) collapsed.title = 'Collapsed preview truncated; expand to parse/view the full JSONL line.';
             content.appendChild(collapsed);
 
             let expanded = false;
@@ -375,7 +420,22 @@
             return row;
         }
 
-        function renderJsonlText(text, sourceLabel) {
+
+        function updateSliceControls(meta) {
+            currentSliceMeta = meta || null;
+            const serverMode = Boolean(filePath && !fileUrl && meta);
+            prevSliceButton.disabled = !serverMode || !meta.hasPrev;
+            nextSliceButton.disabled = !serverMode || !meta.hasNext;
+            latestSliceButton.disabled = !serverMode || !meta.hasNext;
+            jumpLineButton.disabled = !serverMode;
+            jumpLineInput.disabled = !serverMode;
+            if (serverMode) {
+                jumpLineInput.max = String(meta.totalLines || 1);
+                jumpLineInput.placeholder = `${meta.startLine || 1}-${meta.endLine || 1}`;
+            }
+        }
+
+        function renderJsonlText(text, sourceLabel, meta = null) {
             currentSource = sourceLabel;
             fileLabel.textContent = sourceLabel;
             clearViewer();
@@ -384,17 +444,25 @@
             if (lines.length && lines[lines.length - 1] === '') lines.pop();
 
             const fragment = document.createDocumentFragment();
+            const lineNumberBase = meta && meta.startLine ? meta.startLine : 1;
             lines.forEach((line, index) => {
-                fragment.appendChild(makeLine(line, index));
+                fragment.appendChild(makeLine(line, index, lineNumberBase));
             });
 
             viewerEl.appendChild(fragment);
             setLocalEmptyState(false);
-            setStatus(`${lines.length.toLocaleString()} lines`, 'ready');
+            updateSliceControls(meta);
+            if (meta && meta.size !== undefined) {
+                const mb = (meta.size / 1024 / 1024).toFixed(1);
+                const range = `${(meta.startLine || 1).toLocaleString()}-${(meta.endLine || 0).toLocaleString()} of ${(meta.totalLines || lines.length).toLocaleString()}`;
+                setStatus(`lines ${range} • ${mb} MB file • collapsed previews cap very long rows`, 'ready');
+            } else {
+                setStatus(`${lines.length.toLocaleString()} lines`, 'ready');
+            }
         }
 
-        async function loadServerJsonl() {
-            const sourceUrl = serverSourceUrl();
+        async function loadServerJsonl(startLine = null) {
+            const sourceUrl = serverSourceUrl(startLine);
             if (!sourceUrl) {
                 setLocalEmptyState(true);
                 fileLabel.textContent = 'local mode';
@@ -402,7 +470,7 @@
                 return;
             }
 
-            const sourceLabel = filePath || fileUrl;
+            const sourceLabel = sid ? (displayPath || ('sqlite:' + sid)) : (filePath || fileUrl);
             fileLabel.textContent = sourceLabel;
 
             try {
@@ -410,8 +478,14 @@
                 if (!response.ok) {
                     throw new Error(`HTTP ${response.status}`);
                 }
-                const text = await response.text();
-                renderJsonlText(text, sourceLabel);
+                if (filePath && !fileUrl) {
+                    const payload = await response.json();
+                    if (!payload.ok) throw new Error(payload.error || 'tail endpoint failed');
+                    renderJsonlText(payload.text || '', sourceLabel, payload);
+                } else {
+                    const text = await response.text();
+                    renderJsonlText(text, sourceLabel);
+                }
             } catch (err) {
                 setError(`Failed to load JSONL: ${err.message}`);
             }
@@ -423,6 +497,7 @@
                 setStatus(`Reading ${localFileLabel(file)}...`);
                 const text = await file.text();
                 renderJsonlText(text, `local: ${localFileLabel(file)}`);
+                updateSliceControls(null);
             } catch (err) {
                 setError(`Failed to read local file: ${err.message}`);
             }
@@ -515,6 +590,33 @@
 
         wrapToggle.addEventListener('change', () => {
             document.body.classList.toggle('wrap', wrapToggle.checked);
+        });
+
+        lineLimitSelect.addEventListener('change', () => {
+            if (filePath && !fileUrl) loadServerJsonl();
+        });
+
+        prevSliceButton.addEventListener('click', () => {
+            if (!currentSliceMeta) return;
+            const limit = Number(lineLimitSelect.value || 2000);
+            loadServerJsonl(Math.max(1, currentSliceMeta.startLine - limit));
+        });
+
+        nextSliceButton.addEventListener('click', () => {
+            if (!currentSliceMeta) return;
+            loadServerJsonl(currentSliceMeta.endLine + 1);
+        });
+
+        latestSliceButton.addEventListener('click', () => loadServerJsonl());
+
+        function jumpToLine() {
+            const target = Number(jumpLineInput.value);
+            if (!Number.isFinite(target) || target < 1) return;
+            loadServerJsonl(target);
+        }
+        jumpLineButton.addEventListener('click', jumpToLine);
+        jumpLineInput.addEventListener('keydown', event => {
+            if (event.key === 'Enter') jumpToLine();
         });
 
         openFileButton.addEventListener('click', () => {

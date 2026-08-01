@@ -1,0 +1,36 @@
+# Owned normalised PAYG-equivalent token ratecard for CLI imports.
+# USD per million tokens. Normal cost columns use these rates; dashboard EST COST stays subscription/pro-rata allocation.
+model_raw	input_per_mtok	output_per_mtok	cache_read_per_mtok	cache_write_per_mtok	notes
+codex_cli/gpt-5.3-codex	1.75	14	0.175	0	Derived from OpenClaw openai-codex/gpt-5.3-codex logged PAYG-equivalent costs
+codex_cli/gpt-5.4	2.475	14.95	0.2456	0	Derived from OpenClaw openai-codex/gpt-5.4 logged PAYG-equivalent costs
+codex_cli/gpt-5.4-mini	0.75	4.5	0.075	0	Derived from OpenClaw openai-codex/gpt-5.4-mini logged PAYG-equivalent costs
+codex_cli/gpt-5.5	5	30	0.5	0	Derived from OpenClaw openai-codex/gpt-5.5 logged PAYG-equivalent costs
+openai/gpt-5.2	1.75	14	0.175	0	Migrated OpenClaw provider alias; same PAYG-equivalent rates as openai-codex/gpt-5.2
+openai/gpt-5.2-codex	1.75	14	0.175	0	Migrated OpenClaw provider alias; same PAYG-equivalent rates as openai-codex/gpt-5.2-codex
+openai/gpt-5.3-codex	1.75	14	0.175	0	Migrated OpenClaw provider alias; same PAYG-equivalent rates as openai-codex/gpt-5.3-codex
+openai/gpt-5.4	2.475	14.95	0.2456	0	Migrated OpenClaw provider alias; same PAYG-equivalent rates as openai-codex/gpt-5.4
+openai/gpt-5.4-codex	2.475	14.95	0.2456	0	Migrated OpenClaw provider alias; assumed same rates as openai-codex/gpt-5.4
+openai/gpt-5.4-mini	0.75	4.5	0.075	0	Migrated OpenClaw provider alias; same PAYG-equivalent rates as openai-codex/gpt-5.4-mini
+openai/gpt-5.5	5	30	0.5	0	Migrated OpenClaw provider alias; same PAYG-equivalent rates as openai-codex/gpt-5.5
+claude/claude-haiku-4-5-20251001	1	5	0.1	1.25	Anthropic-style PAYG equivalent; cache write 1.25x input, read 0.1x input
+claude/claude-opus-4-5	5	25	0.5	6.25	Derived from Anthropic/OpenClaw logged PAYG-equivalent costs
+claude/claude-opus-4-6	5	25	0.5	6.25	Derived from Anthropic/OpenClaw logged PAYG-equivalent costs
+claude/claude-opus-4-7	5	25	0.5	6.25	Assumed same family pricing as opus 4.x
+claude/claude-opus-4-8	5	25	0.5	6.25	Assumed same family pricing as opus 4.x
+claude/claude-fable-5	10	50	1	12.5	Example override: 2x Opus base (10/50/1/12.5)
+claude/claude-sonnet-4-5	3	15	0.3	3.75	Assumed same family pricing as sonnet 4.x
+claude/claude-sonnet-4-6	3	15	0.3	3.75	Derived from Anthropic/OpenClaw logged PAYG-equivalent costs
+pioneer/claude-opus-4-6	5	25	0.5	6.25	Pioneer = Anthropic opus base. Aligned 2026-06-06 to match experimentally-verified 4-8 base pricing (prior +10% 5.5/27.5/0.55 retired).
+pioneer/claude-opus-4-7	5	25	0.5	6.25	Pioneer = Anthropic opus base. Aligned 2026-06-06 to match experimentally-verified 4-8 base pricing (prior +10% 5.5/27.5/0.55 retired).
+pioneer/claude-opus-4-8	5	25	0.5	6.25	Pioneer Opus 4.8 = Anthropic base (controlled experiment 2026-06-06, 15-row fit, residual <$5e-5). Output was 20 on 2026-06-02; Pioneer raised it to 25 since.
+pioneer/claude-sonnet-4-6	3	15	0.3	3.75	Pioneer = Anthropic base (controlled experiment 2026-06-06, 5-row fit, residual <$3e-5)
+pioneer/claude-haiku-4-5	1	5	0.1	1.25	Pioneer = Anthropic base (controlled experiment 2026-06-06, 5-row fit, residual <$4e-5)
+codex_cli/gpt-5.6-sol	5	30	0.5	6.25	Official short-context rates (developers.openai.com/api/docs/pricing, 2026-07-24)
+codex_cli/gpt-5.6-terra	2.5	15	0.25	3.125	Official short-context rates (developers.openai.com/api/docs/pricing, 2026-07-24)
+codex_cli/gpt-5.6-luna	1	6	0.1	1.25	Official short-context rates (developers.openai.com/api/docs/pricing, 2026-07-24)
+codex_cli/gpt-5.3-codex-spark	1.75	14	0.175	0	Official spark rates captured 2026-07-24 (ctx 128k, max out 32k)
+openai/gpt-5.6-sol	5	30	0.5	6.25	Official short-context rates (developers.openai.com/api/docs/pricing, 2026-07-24)
+openai/gpt-5.6-terra	2.5	15	0.25	3.125	Official short-context rates (developers.openai.com/api/docs/pricing, 2026-07-24)
+openai/gpt-5.6-luna	1	6	0.1	1.25	Official short-context rates (developers.openai.com/api/docs/pricing, 2026-07-24)
+openai/gpt-5.3-codex-spark	1.75	14	0.175	0	Official spark rates captured 2026-07-24 (ctx 128k, max out 32k)
+kimi-code/k3-256k	3	15	0.3	0	Kimi K3 API rate, cache hit 10% of input; CLI logs no cache creation charge currently (web-verified 2026-07-27)

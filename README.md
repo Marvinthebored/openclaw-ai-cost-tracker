@@ -1,17 +1,21 @@
 # AI Cost Tracker
 
-Standalone cost tracker for OpenClaw and Codex CLI session logs.
+Standalone v4 cost tracker for OpenClaw's current per-agent SQLite stores, legacy
+session JSONL, and supported CLI transcripts.
 
 ## What it does
 
-- ingests OpenClaw session `.jsonl` logs and Codex CLI session transcripts into SQLite
+- incrementally ingests `~/.openclaw/agents/*/agent/openclaw-agent.sqlite`
+- retains legacy OpenClaw JSONL plus Codex, Claude Code, and Kimi Code ingestion
+- preserves raw usage rows and marks only proved cross-source duplicates as excluded
 - tracks per-message and per-session token usage
 - splits sessions into model segments when the model changes mid-session
 - serves a browser dashboard for filtering, grouping, and estimated cost analysis
 - opens OpenClaw session logs in a JSONL viewer when you click a session entry
 - can inspect local JSONL/log files in the viewer via drag/drop, file picker, or folder picker
 - shows source session-file metadata alongside tracked sessions
-- includes browser download/upload actions for the editable reference TSV tables (`provider_costs`, `model_reference`, `provider_pru_invoices`)
+- displays four compact editable config panels together in the browser: provider
+  costs, model translations, PRU invoices, and the PAYG-equivalent override rate card
 
 ## What is included
 
@@ -27,7 +31,7 @@ Standalone cost tracker for OpenClaw and Codex CLI session logs.
 ## Prerequisites
 
 - Python 3.11+ recommended
-- OpenClaw session logs and/or Codex CLI session logs available locally
+- OpenClaw data and/or supported CLI transcripts available locally
 - modern browser
 
 No third-party Python packages are required; everything here uses the standard library.
@@ -41,21 +45,23 @@ git clone https://github.com/Marvinthebored/openclaw-ai-cost-tracker.git
 cd openclaw-ai-cost-tracker
 ```
 
-### 1) Choose a sessions directory
+### 1) Confirm the OpenClaw data root
 
-Default OpenClaw location:
+Current OpenClaw stores one live usage database per agent under:
 
 ```bash
-~/.openclaw/agents/main/sessions
+~/.openclaw/agents/*/agent/openclaw-agent.sqlite
 ```
 
-Codex CLI is also auto-discovered by default at:
+Legacy JSONL sessions and Codex CLI transcripts are also auto-discovered at:
 
 ```bash
+~/.openclaw/agents/*/sessions
 ~/.codex/sessions
 ```
 
-If your logs live elsewhere, pass `--sessions-dir` and/or `--codex-sessions-dir` explicitly in the commands below.
+If OpenClaw lives elsewhere, pass `--openclaw-agents-dir`; the other source
+roots also have explicit CLI flags.
 
 ### 2) Build the database
 
@@ -65,17 +71,18 @@ From this package directory:
 python3 migrate_sessions.py --full
 ```
 
-Or with an explicit sessions path:
+Or with an explicit OpenClaw root:
 
 ```bash
 python3 migrate_sessions.py --full \
-  --sessions-dir /path/to/openclaw/agents/main/sessions
+  --openclaw-agents-dir /path/to/openclaw/agents
 ```
 
-With both OpenClaw and Codex paths pinned explicitly:
+With OpenClaw, legacy JSONL, and Codex paths pinned explicitly:
 
 ```bash
 python3 migrate_sessions.py --full \
+  --openclaw-agents-dir /path/to/openclaw/agents \
   --sessions-dir /path/to/openclaw/agents/main/sessions \
   --codex-sessions-dir /path/to/.codex/sessions
 ```
@@ -104,6 +111,7 @@ If you used a non-default sessions directory and want the dashboard's **Refresh*
 
 ```bash
 python3 server.py \
+  --openclaw-agents-dir /path/to/openclaw/agents \
   --sessions-dir /path/to/openclaw/agents/main/sessions \
   --codex-sessions-dir /path/to/.codex/sessions \
   --channel-mapping /path/to/channel_mapping.json
@@ -111,11 +119,14 @@ python3 server.py \
 
 ## Ingest flow
 
-1. `migrate_sessions.py` scans OpenClaw `.jsonl` session files and Codex CLI session transcripts.
+1. `migrate_sessions.py` scans per-agent OpenClaw SQLite stores and supported
+   JSONL/CLI sources.
 2. Session metadata goes into `sessions`.
 3. Assistant messages and token/cost data go into `messages`.
-4. Consecutive messages using the same model are rolled into `segments`.
-5. `ingest_state` tracks offsets so later runs can be incremental.
+4. Cross-source reconciliation keeps every raw row, marking only strict duplicate
+   matches with `duplicate_of`, `excluded_reason`, and `is_excluded`.
+5. Non-excluded messages are rolled into model `segments`.
+6. `ingest_state` tracks SQLite rowids and file offsets for incremental refreshes.
 
 ### Full rebuild
 
@@ -139,19 +150,21 @@ Use this for normal day-to-day refreshes.
 ## Run flow
 
 - `server.py` serves `dashboard.html`
-- the browser calls `/api/cost-v31/sessions` for segment summaries
-- expanded rows call `/api/cost-v31/messages` on demand, so large databases do not eagerly ship every message to the browser
+- the browser calls `/api/cost-v4/sessions` for segment summaries
+- expanded rows call `/api/cost-v4/messages` on demand, so large databases do not eagerly ship every message to the browser
 - the server queries SQLite and returns:
   - session segment rows
   - per-message detail rows when requested
   - provider totals
   - reference-table data used for cost estimation
-- clicking a session entry opens the underlying OpenClaw log in the JSONL viewer
+- clicking a session entry opens either its SQLite transcript or source log in
+  the JSONL viewer
 - clicking **Refresh** calls the migration script in incremental mode
 
 ## Raw session log browsing
 
-Session rows open `/jsonl-viewer`, which fetches the matching raw log file through the public-package `/session-log/<session_id>` endpoint.
+Session rows open `/jsonl-viewer`, which fetches a SQLite transcript from
+`/api/cost-v4/transcript/<session_id>` or a bounded local source-log slice.
 
 The same viewer can also browse local files without uploading them anywhere:
 
@@ -163,14 +176,18 @@ If you run the tracker locally and prefer a different workflow, you can customiz
 
 ## Reference data
 
-The tracker uses three editable reference tables.
-
-In the browser UI, these tables can be downloaded as TSV, edited externally, and uploaded back into the tracker.
-
+The tracker exposes four compact editable panels together under **Config →
+Reference tables**. Each panel saves independently.
 
 - `provider_costs` — billing periods and plan types
-- `model_reference` — display labels and PRU multipliers
+- `model_reference` — raw-model translations, display labels, and PRU multipliers
 - `provider_pru_invoices` — manual PRU invoice rows for providers like GitHub Copilot
+- `payg_model_rates` — file-backed per-million-token override rates used to
+  calculate PAYG-equivalent imported costs
+
+The first three can also be exported/imported as TSV. `payg_model_rates.tsv`
+is edited directly by its browser panel or as a normal TSV file. Saving it does
+not rewrite historical rows until the next **Refresh**.
 
 ### Export live DB tables to TSV
 
@@ -207,7 +224,10 @@ python3 import_pru_invoice_csv.py \
 - Unknown models are auto-added to `model_reference` during ingest.
 - Codex CLI sessions are imported with `model_raw` values prefixed `codex_cli/`.
 - Channel mapping is optional; without it, the tracker still works.
-- This project is built for OpenClaw session logs and Codex CLI transcripts, not arbitrary chat exports.
+- OpenClaw SQLite ingestion is enabled by default; use
+  `--no-openclaw-sqlite` only for a deliberate legacy-only run.
+- SQLite databases, logs, backups, output, and local mapping files are ignored by Git.
+- This project is built for OpenClaw and supported CLI transcripts, not arbitrary chat exports.
 
 ## License
 

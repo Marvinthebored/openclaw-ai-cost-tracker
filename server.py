@@ -22,8 +22,11 @@ DEFAULT_REF_EXPORT_SCRIPT = ROOT / 'ref_export.py'
 DEFAULT_REF_IMPORT_SCRIPT = ROOT / 'ref_import.py'
 DEFAULT_BACKUPS_DIR = ROOT / 'backups'
 DEFAULT_SESSIONS_DIR = Path.home() / '.openclaw' / 'agents' / 'main' / 'sessions'
+DEFAULT_OPENCLAW_AGENTS_DIR = Path.home() / '.openclaw' / 'agents'
 DEFAULT_CODEX_SESSIONS_DIR = Path.home() / '.codex' / 'sessions'
-VALID_REF_TABLES = {'provider_costs', 'model_reference', 'provider_pru_invoices'}
+VALID_REF_TABLES = {'provider_costs', 'model_reference', 'provider_pru_invoices', 'payg_model_rates'}
+PAYG_RATE_COLS = ['model_raw', 'input_per_mtok', 'output_per_mtok', 'cache_read_per_mtok', 'cache_write_per_mtok', 'notes']
+PAYG_RATE_NUMERIC = {'input_per_mtok', 'output_per_mtok', 'cache_read_per_mtok', 'cache_write_per_mtok'}
 
 
 def parse_args():
@@ -37,6 +40,7 @@ def parse_args():
     ap.add_argument('--ref-export-script', default=str(DEFAULT_REF_EXPORT_SCRIPT))
     ap.add_argument('--ref-import-script', default=str(DEFAULT_REF_IMPORT_SCRIPT))
     ap.add_argument('--sessions-dir', default=str(DEFAULT_SESSIONS_DIR), help='OpenClaw session log directory used by the refresh endpoint')
+    ap.add_argument('--openclaw-agents-dir', default=str(DEFAULT_OPENCLAW_AGENTS_DIR), help='OpenClaw agents root containing the new per-agent SQLite stores')
     ap.add_argument('--codex-sessions-dir', default=str(DEFAULT_CODEX_SESSIONS_DIR), help='Codex CLI session log directory used by the refresh endpoint')
     ap.add_argument('--channel-mapping', default=None, help='Optional JSON channel-mapping file passed through to migrate_sessions.py')
     ap.add_argument('--backups-dir', default=str(DEFAULT_BACKUPS_DIR), help='Backup directory passed through to migrate_sessions.py')
@@ -113,23 +117,33 @@ class TrackerHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
 
-        if path in ('/', '/index.html', '/cost/v3'):
+        if path in ('/', '/index.html', '/cost', '/cost/v4'):
             self.serve_dashboard()
             return
         if path == '/jsonl-viewer':
             self.serve_jsonl_viewer()
             return
+        if path == '/favicon.svg':
+            favicon = ROOT / 'favicon.svg'
+            self._respond(200, favicon.read_bytes(), 'image/svg+xml')
+            return
+        if path == '/api/jsonl-tail':
+            self.handle_jsonl_tail(parsed)
+            return
         if path.startswith('/session-log/'):
             self.handle_session_log(unquote(path[len('/session-log/'):]))
             return
-        if path in ('/api/cost-v3/sessions', '/api/cost-v31/sessions'):
+        if path in ('/api/cost-v3/sessions', '/api/cost-v31/sessions', '/api/cost-v4/sessions'):
             self.handle_sessions()
             return
-        if path == '/api/cost-v31/messages':
+        if path in ('/api/cost-v31/messages', '/api/cost-v4/messages'):
             self.handle_messages(parsed)
             return
-        if path == '/api/cost-v3/refresh':
+        if path in ('/api/cost-v3/refresh', '/api/cost-v4/refresh'):
             self.handle_refresh()
+            return
+        if path.startswith('/api/cost-v4/transcript/'):
+            self.handle_openclaw_transcript(unquote(path[len('/api/cost-v4/transcript/'):]))
             return
         if path.startswith('/api/cost-v3/ref-disk/'):
             action = path.rsplit('/', 1)[-1]
@@ -215,6 +229,100 @@ class TrackerHandler(BaseHTTPRequestHandler):
             headers={'Content-Disposition': f'inline; filename="{safe_filename}"'},
         )
 
+    def handle_openclaw_transcript(self, session_id):
+        """Serve one OpenClaw SQLite transcript as JSONL for the viewer."""
+        if not re.fullmatch(r'[0-9A-Za-z._:-]{1,160}', session_id or ''):
+            self._json(400, {'error': 'Invalid session_id'})
+            return
+
+        lines = []
+        agents_root = self.cfg['openclaw_agents_dir']
+        for db_path in sorted(agents_root.glob('*/agent/openclaw-agent.sqlite')):
+            try:
+                conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
+                conn.row_factory = sqlite3.Row
+                try:
+                    rows = conn.execute(
+                        'SELECT event_json FROM transcript_events WHERE session_id = ? ORDER BY seq',
+                        (session_id,),
+                    ).fetchall()
+                finally:
+                    conn.close()
+                if rows:
+                    lines = [row['event_json'] for row in rows]
+                    break
+            except (OSError, sqlite3.Error):
+                continue
+
+        if lines:
+            self._respond(200, '\n'.join(lines) + '\n', 'text/plain; charset=utf-8')
+            return
+
+        # Older JSONL-only OpenClaw installs still get a working log link.
+        conn = self._db()
+        try:
+            row = conn.execute('SELECT filename FROM sessions WHERE session_id = ?', (session_id,)).fetchone() if conn else None
+        finally:
+            if conn:
+                conn.close()
+        filename = row['filename'] if row else None
+        file_path = resolve_session_log_path(filename, self.cfg['sessions_dir'], self.cfg['codex_sessions_dir'])
+        if file_path:
+            self._respond(200, file_path.read_bytes(), 'text/plain; charset=utf-8')
+            return
+        self._json(404, {'error': f'No transcript found for session {session_id}'})
+
+    def handle_jsonl_tail(self, parsed):
+        """Serve a bounded slice of an explicitly allowed local text file."""
+        params = parse_qs(parsed.query)
+        raw_path = unquote((params.get('path') or [''])[0])
+        if not raw_path:
+            self._json(400, {'error': 'Missing path'})
+            return
+        candidate = Path(raw_path).expanduser().resolve()
+        allowed_roots = [
+            ROOT.resolve(),
+            self.cfg['sessions_dir'].resolve(),
+            self.cfg['codex_sessions_dir'].resolve(),
+            self.cfg['openclaw_agents_dir'].resolve(),
+            (Path.home() / '.claude').resolve(),
+            (Path.home() / '.kimi-code').resolve(),
+        ]
+        if not any(candidate == root or candidate.is_relative_to(root) for root in allowed_roots):
+            self._json(403, {'error': 'Path is outside the allowed local roots'})
+            return
+        if not candidate.is_file():
+            self._json(404, {'error': f'File not found: {raw_path}'})
+            return
+        try:
+            limit = max(1, min(int((params.get('lines') or ['2000'])[0]), 20000))
+        except ValueError:
+            limit = 2000
+        try:
+            start = int((params.get('start') or ['0'])[0])
+        except ValueError:
+            start = 0
+        lines = candidate.read_text(encoding='utf-8', errors='replace').splitlines()
+        total = len(lines)
+        start_index = max(0, start - 1) if start > 0 else max(0, total - limit)
+        selected = lines[start_index:start_index + limit]
+        start_line = start_index + 1 if selected else 0
+        end_line = start_index + len(selected)
+        self._json(200, {
+            'ok': True,
+            'path': raw_path,
+            'size': candidate.stat().st_size,
+            'totalLines': total,
+            'startLine': start_line,
+            'endLine': end_line,
+            'linesReturned': len(selected),
+            'requestedLines': limit,
+            'truncated': len(selected) < total,
+            'hasPrev': start_index > 0,
+            'hasNext': end_line < total,
+            'text': '\n'.join(selected),
+        })
+
     def _metadata_payload(self, conn):
         provider_totals_raw = {
             row['raw_provider']: row['total_tokens']
@@ -249,7 +357,9 @@ class TrackerHandler(BaseHTTPRequestHandler):
         }
         provider_aliases = {
             'kimi-coding': 'kimi-code',
+            'kimi': 'kimi-code',
             'ollama-cloud': 'opencode',
+            'deepseek-direct': 'deepseek',
         }
         provider_totals = {}
         for raw_provider, tokens in provider_totals_raw.items():
@@ -279,6 +389,17 @@ class TrackerHandler(BaseHTTPRequestHandler):
             provider_costs[row['provider']] = row
             provider_cost_periods.setdefault(row['provider'], []).append(row)
 
+        pioneer_ratecard = {}
+        for row in self._read_payg_rates():
+            model_raw = row.get('model_raw') or ''
+            if model_raw.startswith('pioneer/'):
+                pioneer_ratecard[model_raw] = {
+                    'input': row.get('input_per_mtok') or 0,
+                    'output': row.get('output_per_mtok') or 0,
+                    'cache_read': row.get('cache_read_per_mtok') or 0,
+                    'cache_write': row.get('cache_write_per_mtok') or 0,
+                }
+
         return {
             'provider_totals': provider_totals,
             'provider_costs': provider_costs,
@@ -287,6 +408,8 @@ class TrackerHandler(BaseHTTPRequestHandler):
             'copilot_opus_tokens': tier_row['opus_tokens'] if tier_row else 0,
             'copilot_other_tokens': tier_row['other_tokens'] if tier_row else 0,
             'copilot_other_prus': tier_row['other_prus'] if tier_row else 0,
+            'pioneer_ratecard': pioneer_ratecard,
+            'pioneer_estimate_tokens': 1200,
         }
 
     def handle_sessions(self):
@@ -342,6 +465,7 @@ class TrackerHandler(BaseHTTPRequestHandler):
                     seg.cache_write,
                     seg.input_tokens + seg.cache_read + seg.cache_write AS total_in,
                     seg.total_tokens,
+                    seg.cost_input AS cost_input,
                     seg.cost_input + seg.cost_output AS cost_io,
                     seg.cost_cache_read + seg.cost_cache_write AS cost_cache,
                     seg.cost_total AS cost_logged
@@ -406,6 +530,8 @@ class TrackerHandler(BaseHTTPRequestHandler):
                 "m.timestamp >= ?",
                 "m.timestamp <= ?",
             ]
+            if any(row[1] == 'is_excluded' for row in conn.execute('PRAGMA table_info(messages)')):
+                where.append('COALESCE(m.is_excluded, 0) = 0')
             args = [
                 session_id,
                 model_raw,
@@ -454,6 +580,8 @@ class TrackerHandler(BaseHTTPRequestHandler):
             '--incremental',
             '--db', str(self.cfg['db']),
             '--sessions-dir', str(self.cfg['sessions_dir']),
+            '--openclaw-agents-dir', str(self.cfg['openclaw_agents_dir']),
+            '--openclaw-sqlite',
             '--codex-sessions-dir', str(self.cfg['codex_sessions_dir']),
             '--backups-dir', str(self.cfg['backups_dir']),
         ]
@@ -483,6 +611,9 @@ class TrackerHandler(BaseHTTPRequestHandler):
             self._json(500, {'error': str(exc)})
 
     def handle_ref_get(self, table):
+        if table == 'payg_model_rates':
+            self._json(200, {'table': table, 'rows': self._read_payg_rates()})
+            return
         conn = self._db()
         if not conn:
             self._json(500, {'error': f'Database not found: {self.cfg["db"]}'})
@@ -513,6 +644,15 @@ class TrackerHandler(BaseHTTPRequestHandler):
             if not rows:
                 self._json(400, {'error': 'No rows provided'})
                 return
+            if table == 'payg_model_rates':
+                self._write_payg_rates(rows)
+                self._json(200, {
+                    'ok': True,
+                    'table': table,
+                    'saved': len(rows),
+                    'note': 'File-backed rate card saved; Refresh reprices derived costs.',
+                })
+                return
             if table == 'provider_costs':
                 conn.execute('DELETE FROM provider_costs')
                 for r in rows:
@@ -521,7 +661,11 @@ class TrackerHandler(BaseHTTPRequestHandler):
                         (r.get('provider'), r.get('billing_start'), r.get('plan_type', 'flat'), r.get('monthly_cost'), r.get('extra_usage'), r.get('notes')),
                     )
             elif table == 'model_reference':
+                import migrate_sessions as migrator
                 for r in rows:
+                    model_raw = r.get('model_raw') or ''
+                    inferred_endpoint, inferred_author, _model, _pru = migrator.infer_model_reference(model_raw)
+                    endpoint_in = r.get('endpoint') or inferred_endpoint or ''
                     conn.execute(
                         '''
                         INSERT INTO model_reference (model_raw, endpoint, author, model, pru_multiplier)
@@ -532,7 +676,13 @@ class TrackerHandler(BaseHTTPRequestHandler):
                             model=excluded.model,
                             pru_multiplier=excluded.pru_multiplier
                         ''',
-                        (r.get('model_raw'), r.get('endpoint', ''), r.get('author', ''), r.get('model', ''), r.get('pru_multiplier', 1.0)),
+                        (
+                            model_raw,
+                            migrator.MODEL_ENDPOINT_ALIASES.get(endpoint_in, endpoint_in),
+                            r.get('author') or inferred_author or '',
+                            migrator.canonical_model_display_name(model_raw),
+                            1.0 if r.get('pru_multiplier') in (None, '') else r.get('pru_multiplier'),
+                        ),
                     )
             else:
                 conn.execute('DELETE FROM provider_pru_invoices')
@@ -541,8 +691,29 @@ class TrackerHandler(BaseHTTPRequestHandler):
                         'INSERT INTO provider_pru_invoices (provider, cycle_start, cycle_end, model_raw, prus, included_requests, billed_requests, notes) VALUES (?,?,?,?,?,?,?,?)',
                         (r.get('provider'), r.get('cycle_start'), r.get('cycle_end'), r.get('model_raw'), r.get('prus', 0), r.get('included_requests'), r.get('billed_requests', 0), r.get('notes')),
                     )
+            deleted_count = 0
+            refused = []
+            if table == 'model_reference':
+                for model_raw in data.get('deleted') or []:
+                    if not isinstance(model_raw, str) or not model_raw:
+                        continue
+                    ref_row = conn.execute('SELECT id FROM model_reference WHERE model_raw = ?', (model_raw,)).fetchone()
+                    if not ref_row:
+                        continue
+                    used = conn.execute('SELECT COUNT(*) FROM messages WHERE model_ref_id = ?', (ref_row['id'],)).fetchone()[0]
+                    if used:
+                        refused.append({'model_raw': model_raw, 'messages': used})
+                    else:
+                        conn.execute('DELETE FROM model_reference WHERE id = ?', (ref_row['id'],))
+                        deleted_count += 1
             conn.commit()
-            self._json(200, {'ok': True, 'table': table, 'saved': len(rows)})
+            self._json(200, {
+                'ok': True,
+                'table': table,
+                'saved': len(rows),
+                'deleted': deleted_count,
+                'refused': refused,
+            })
         except Exception as exc:
             conn.rollback()
             self._json(500, {'error': str(exc)})
@@ -560,6 +731,66 @@ class TrackerHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._json(500, {'ok': False, 'error': str(exc)})
 
+    def _payg_rate_path(self):
+        return self.cfg['ref_dir'] / 'payg_model_rates.tsv'
+
+    def _read_payg_rates(self):
+        path = self._payg_rate_path()
+        if not path.exists():
+            return []
+        rows = []
+        for line in path.read_text(encoding='utf-8').splitlines():
+            if not line.strip() or line.lstrip().startswith('#'):
+                continue
+            parts = line.split('\t')
+            if parts[0].strip() == 'model_raw':
+                continue
+            row = {}
+            for index, column in enumerate(PAYG_RATE_COLS):
+                value = parts[index].strip() if index < len(parts) else ''
+                if column in PAYG_RATE_NUMERIC:
+                    try:
+                        row[column] = float(value) if value else None
+                    except ValueError:
+                        row[column] = None
+                else:
+                    row[column] = value or None
+            rows.append(row)
+        return rows
+
+    def _write_payg_rates(self, rows):
+        path = self._payg_rate_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        comments = []
+        if path.exists():
+            for line in path.read_text(encoding='utf-8').splitlines():
+                if line.lstrip().startswith('#'):
+                    comments.append(line)
+                else:
+                    break
+        if not comments:
+            comments = [
+                '# User-owned PAYG-equivalent rate card for imported usage.',
+                '# USD per million tokens; edit in the browser or as TSV.',
+            ]
+
+        def fmt(value):
+            if value in (None, ''):
+                return ''
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                return str(value)
+            return str(int(number)) if number.is_integer() else str(number)
+
+        lines = comments + ['\t'.join(PAYG_RATE_COLS)]
+        for row in rows:
+            lines.append('\t'.join(
+                fmt(row.get(column)) if column in PAYG_RATE_NUMERIC else str(row.get(column) or '')
+                for column in PAYG_RATE_COLS
+            ))
+        path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+
 
 def main():
     args = parse_args()
@@ -571,6 +802,7 @@ def main():
         'ref_export_script': Path(args.ref_export_script).expanduser().resolve(),
         'ref_import_script': Path(args.ref_import_script).expanduser().resolve(),
         'sessions_dir': Path(args.sessions_dir).expanduser().resolve(),
+        'openclaw_agents_dir': Path(args.openclaw_agents_dir).expanduser().resolve(),
         'codex_sessions_dir': Path(args.codex_sessions_dir).expanduser().resolve(),
         'channel_mapping': Path(args.channel_mapping).expanduser().resolve() if args.channel_mapping else None,
         'backups_dir': Path(args.backups_dir).expanduser().resolve(),
@@ -580,6 +812,7 @@ def main():
         print(f'Database: {config["db"]}')
         print(f'Dashboard: {config["dashboard"]}')
         print(f'OpenClaw sessions: {config["sessions_dir"]}')
+        print(f'OpenClaw agents: {config["openclaw_agents_dir"]}')
         print(f'Codex sessions: {config["codex_sessions_dir"]}')
         try:
             httpd.serve_forever()

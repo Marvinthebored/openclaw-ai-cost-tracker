@@ -1,26 +1,19 @@
-# AI Cost Tracker Public Package - Resume
+# AI Cost Tracker Public Package - Release State
 
-## What was packaged
+## Current package
 
-- standalone `server.py` replacing the dependency on Marvin's `dashboard_server.py`
-- sanitized v3.1 `dashboard.html` copied from the live tracker, using lazy message drilldown
-- portable `migrate_sessions.py` with CLI-configurable paths
-- portable reference-table utilities:
-  - `ref_export.py`
-  - `ref_import.py`
-  - `import_pru_invoice_csv.py`
-- safe sample/template files in `ref/`
-- `channel_mapping.example.json`
-- packaging docs: `README.md`, `.gitignore`
+- v4 dashboard and standalone Python server
+- current OpenClaw per-agent SQLite ingestion, plus legacy JSONL sources
+- auditable message-level duplicate reconciliation
+- lazy per-segment message drilldown and SQLite transcript viewing
+- four compact in-browser config panels:
+  - provider costs
+  - model translations
+  - PRU invoices
+  - PAYG-equivalent token-rate overrides
+- browser and TSV workflows share the same local reference data
 
-## Important caveats
+## Safety boundary
 
-- this package assumes OpenClaw session `.jsonl` files and Codex CLI session transcripts
-- no sample session logs are included
-- git remote: `https://github.com/Marvinthebored/openclaw-ai-cost-tracker.git`
-- the dashboard UI is inline HTML/JS copied from the live tracker, so future UI changes will need manual sync
-
-## Remaining pre-publish checks
-
-1. optionally add screenshots
-2. optionally add a tiny bundled sample log fixture for demo mode
+No usage database, transcript, backup, local channel mapping, screenshot, or
+machine-specific path is included in the repository.

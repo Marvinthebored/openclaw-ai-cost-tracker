@@ -2,7 +2,8 @@
 
 The `/ref/` directory contains simple TSV files that act as handy editing tools for the user-maintained lookup/config tables.
 
-They are meant to be easy to open in a spreadsheet editor, review, edit, and re-import without touching code.
+They can be edited in the dashboard's compact four-panel config view or in a
+spreadsheet editor.
 
 ## Files
 
@@ -47,6 +48,12 @@ Contains:
 - PRU totals
 - optional request-count fields
 - notes
+
+### `payg_model_rates.tsv`
+
+File-backed override rate card for imported PAYG-equivalent costs. Rates are in
+USD per million input, output, cache-read, and cache-write tokens. Saving the
+browser panel updates this file; run **Refresh** to reprice derived rows.
 
 ## Important current status
 

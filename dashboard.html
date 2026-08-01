@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI Cost Tracker v3.1 - Marvin's Workshop</title>
+    <title>OpenClaw AI Cost Tracker v4</title>
     <link rel="icon" href="/favicon.svg" type="image/svg+xml">
     <style>
         :root {
@@ -16,7 +16,9 @@
             --green: #3fb950;
             --red: #f85149;
             --yellow: #d29922;
-            --cost-logged: #cfe8ff;
+            --cost-logged: #cfe8ff;       /* bright blue: ALL TOKENS + TOTAL */
+            --cost-sub: #9bbfe0;          /* darker blue: I+O + CACHE */
+            --mtok: #b5bcc4;              /* ~10% darker than --text for /MTOK */
         }
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
@@ -145,7 +147,6 @@
         .author { color: var(--text-muted); }
         .model { color: var(--green); }
         .channel { color: var(--text-muted); font-size: 11px; max-width: 70px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .hit-rate { color: var(--text-muted); font-size: 10px; }
         .label { max-width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .type-badge {
             display: inline-block;
@@ -159,6 +160,9 @@
         .type-cron { background: #a371f7; color: var(--bg); }
         .cost { color: var(--green); font-weight: 500; }
         .cost-logged { color: var(--cost-logged); }
+        .cost-sub { color: var(--cost-sub); font-size: 11px; }
+        .col-mtok-shade { color: var(--mtok); }
+        .col-alltok-bright { color: var(--cost-logged); }
         .col-cost { min-width: 72px; }
         .col-mtok { min-width: 68px; }
 
@@ -267,16 +271,112 @@
             cursor: pointer;
         }
         .filter-menu button:hover { background: var(--accent); color: var(--bg); }
+
+        /* ── Reference-tables in-page editor · build 2026.07.30.1 ─────────── */
+        .ref-h2 { display: flex; align-items: center; gap: 10px; }
+        .ref-hint { font-size: 10px; color: var(--text-muted); font-weight: 400; text-transform: none; letter-spacing: 0.3px; }
+        .ref-toggle {
+            font: inherit; font-size: 10px; background: var(--card-bg);
+            border: 1px solid var(--border); color: var(--text-muted);
+            border-radius: 4px; padding: 3px 9px; cursor: pointer;
+            transition: border-color 0.15s, color 0.15s;
+        }
+        .ref-toggle:hover { border-color: var(--accent); color: var(--text); }
+        .ref-stack { display: flex; flex-direction: column; align-items: flex-start; gap: 16px; margin-top: 4px; }
+        .ref-filebar {
+            display: flex; flex-wrap: wrap; align-items: center; gap: 14px;
+            padding: 7px 10px; margin-bottom: 12px; background: rgba(255,255,255,0.02);
+            border: 1px solid var(--border); border-radius: 6px;
+        }
+        .ref-filebar-group { display: flex; align-items: center; gap: 6px; }
+        .ref-filebar-label { font-size: 9px; text-transform: uppercase; letter-spacing: 0.6px; color: var(--text-muted); font-weight: 600; margin-right: 1px; }
+        .ref-panel {
+            background: var(--card-bg); border: 1px solid var(--border);
+            border-radius: 6px; display: flex; flex-direction: column; width: fit-content; max-width: 100%;
+            transition: border-color 0.2s, box-shadow 0.2s;
+        }
+        .ref-panel.ref-dirty { border-color: rgba(210,153,34,0.55); box-shadow: inset 0 0 0 1px rgba(210,153,34,0.18); }
+        /* --wide removed 2026.07.30.2: tables now size to content, stacked */
+        .ref-panel-head {
+            display: flex; align-items: center; gap: 8px; padding: 6px 8px;
+            border-bottom: 1px solid var(--border); background: rgba(255,255,255,0.02);
+            border-radius: 6px 6px 0 0;
+        }
+        .ref-panel-name { font-size: 10px; text-transform: uppercase; letter-spacing: 0.6px; color: var(--text-muted); font-weight: 600; white-space: nowrap; }
+        .ref-rowcount { font-size: 10px; color: var(--text-muted); font-family: "SF Mono", Menlo, Monaco, Consolas, monospace; white-space: nowrap; }
+        .ref-head-actions { margin-left: auto; display: flex; gap: 6px; align-items: center; }
+        .ref-btn {
+            font: inherit; font-size: 10px; border: 1px solid var(--border);
+            background: #21262d; color: var(--text); border-radius: 4px;
+            padding: 2px 7px; cursor: pointer; line-height: 1.4;
+            transition: border-color 0.15s, background 0.15s, color 0.15s, opacity 0.15s;
+        }
+        .ref-btn:hover:not(:disabled) { border-color: var(--accent); }
+        .ref-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+        .ref-btn-save { min-width: 52px; }
+        .ref-btn-save.ref-save-ready { border-color: var(--green); color: var(--green); }
+        .ref-dot { width: 6px; height: 6px; border-radius: 50%; background: transparent; flex: none; transition: background 0.2s; }
+        .ref-dirty .ref-dot { background: var(--yellow); animation: refPulse 1.6s ease-in-out infinite; }
+        @keyframes refPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+        .ref-scroll { overflow-x: auto; max-width: 100%; }
+        /* vertical cap removed 2026.07.30.2: long tables show in full */
+        table.ref-table { border-collapse: collapse; width: auto;
+            font-family: "SF Mono", Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+            font-size: 11px; line-height: 1.35; }
+        .ref-table th {
+            position: sticky; top: 0; z-index: 2; background: var(--card-bg);
+            border-bottom: 1px solid var(--border); color: var(--text-muted);
+            font-size: 9px; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600;
+            text-align: left; padding: 4px 5px; white-space: nowrap; overflow: hidden;
+        }
+        .ref-table td { border-bottom: 1px solid rgba(48,54,61,0.5); padding: 0; vertical-align: middle; }
+        .ref-table tbody tr:hover td { background: rgba(88,166,255,0.06); }
+        .ref-cell {
+            width: auto; background: transparent; border: 1px solid transparent;
+            color: var(--text); font: inherit; padding: 3px 5px; border-radius: 3px;
+            transition: border-color 0.12s, background 0.12s, box-shadow 0.12s; min-width: 0;
+        }
+        .ref-cell:hover { border-color: rgba(48,54,61,0.9); }
+        .ref-cell:focus { outline: none; border-color: var(--accent); background: rgba(13,17,23,0.7); box-shadow: 0 0 0 2px rgba(88,166,255,0.15); }
+        .ref-cell.ref-num { text-align: right; font-variant-numeric: tabular-nums; }
+        .ref-derived { color: var(--text-muted); font-style: italic; user-select: none; white-space: nowrap; }
+        .ref-cell--select {
+            appearance: none; -webkit-appearance: none; cursor: pointer; padding-right: 16px;
+            background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='8' height='5'><path d='M0 0l4 5 4-5z' fill='%238b949e'/></svg>");
+            background-repeat: no-repeat; background-position: right 5px center;
+        }
+        .ref-del {
+            width: 16px; border: 0; background: transparent; color: var(--text-muted);
+            cursor: pointer; font: inherit; padding: 0; opacity: 0; text-align: center;
+            transition: opacity 0.12s, color 0.12s;
+        }
+        .ref-table tbody tr:hover .ref-del { opacity: 0.7; }
+        .ref-del:hover { opacity: 1 !important; color: var(--red); }
+        .ref-empty { padding: 14px; color: var(--text-muted); text-align: center; font-size: 11px; }
+        .ref-toast-wrap { position: fixed; right: 16px; bottom: 16px; display: flex; flex-direction: column; gap: 8px; z-index: 200; }
+        .ref-toast {
+            background: var(--card-bg); border: 1px solid var(--border); border-left: 3px solid var(--accent);
+            color: var(--text); font-size: 11px;
+            font-family: "SF Mono", Menlo, Monaco, Consolas, monospace;
+            padding: 8px 12px; border-radius: 5px; box-shadow: 0 6px 18px rgba(0,0,0,0.45);
+            opacity: 0; transform: translateY(6px); transition: opacity 0.18s, transform 0.18s; max-width: 380px;
+        }
+        .ref-toast.ref-toast-show { opacity: 1; transform: none; }
+        .ref-toast--ok { border-left-color: var(--green); }
+        .ref-toast--err { border-left-color: var(--red); }
+        .ref-build-stamp { color: var(--text-muted); font-size: 10px; letter-spacing: 0.4px; }
+        /* responsive grid removed 2026.07.30.2 */
     </style>
 </head>
 <body>
 <div class="container">
     <header>
-        <h1>🤖 AI Cost Tracker v3.1</h1>
-        <div class="timestamp">Generated: <span id="generated-time">Loading...</span></div>
+        <h1>🤖 AI Cost Tracker v4</h1>
+        <div class="timestamp">Generated: <span id="generated-time">Loading...</span> · <span class="ref-build-stamp">Build 2026.08.01.1 · OpenClaw SQLite + in-page rate cards</span></div>
         <div id="warning-bar" class="warning-bar"></div>
     </header>
 
+    <div id="view-main">
     <div class="controls">
         <div class="control-group">
             <label>TZ</label>
@@ -312,31 +412,27 @@
                 Hide no-usage
             </label>
         </div>
+        <div class="control-group" style="position: relative;">
+            <label title="Override Pioneer Input (display + cost) with a flat 1200/msg estimate, per model. Local view only — the DB keeps raw session-log data.">Pioneer in</label>
+            <button id="pioneer-override-btn" onclick="togglePioneerMenu(event)"
+                style="background: var(--card-bg); border: 1px solid var(--border); color: var(--text); padding: 6px 10px; border-radius: 4px; cursor: pointer;">
+                ⚖️ <span id="pioneer-override-summary">raw</span> ▾
+            </button>
+            <div id="pioneer-override-menu" style="display:none; position:absolute; left:0; top:110%; background:var(--card-bg); border:1px solid var(--border); border-radius:6px; padding:8px 0; z-index:100; min-width:260px; box-shadow:0 4px 12px rgba(0,0,0,0.4);">
+                <div style="padding:4px 12px; color:var(--text-muted); font-size:10px; text-transform:uppercase; letter-spacing:0.5px;">Override Input → 1200/msg</div>
+                <div id="pioneer-override-list" style="padding:2px 0;"></div>
+                <div style="border-top:1px solid var(--border); margin:6px 0;"></div>
+                <a class="cfg-item" onclick="setAllPioneerOverrides(true)">✓ Override all</a>
+                <a class="cfg-item" onclick="setAllPioneerOverrides(false)">✗ Show all raw</a>
+            </div>
+        </div>
         <div class="control-group" style="margin-left:auto; display: flex; gap: 8px; align-items: center;">
             <button id="refresh-btn" onclick="refreshData()" style="background: #4CAF50; border: none; color: white; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-weight: 500;">⟳ Refresh</button>
             <button onclick="clearFilters()" style="background: var(--card-bg); border: 1px solid var(--border); color: var(--text); padding: 6px 10px; border-radius: 4px; cursor: pointer;">Clear</button>
-            <div style="position: relative; display: inline-block;">
-                <button id="config-btn" onclick="toggleConfigMenu()" style="background: var(--card-bg); border: 1px solid var(--border); color: var(--text); padding: 6px 10px; border-radius: 4px; cursor: pointer;">⚙️ Config</button>
-                <div id="config-menu" style="display:none; position:absolute; right:0; top:110%; background:var(--card-bg); border:1px solid var(--border); border-radius:6px; padding:6px 0; z-index:100; min-width:220px; box-shadow:0 4px 12px rgba(0,0,0,0.4);">
-                    <div style="padding:4px 12px; color:var(--text-muted); font-size:10px; text-transform:uppercase; letter-spacing:0.5px;">TSV files (ref/ folder)</div>
-                    <a class="cfg-item" onclick="refDisk('export')">📋 Export DB → ref/*.tsv</a>
-                    <a class="cfg-item" onclick="refDisk('import')">📥 Import ref/*.tsv → DB</a>
-                    <div style="border-top:1px solid var(--border); margin:4px 0;"></div>
-                    <div style="padding:4px 12px; color:var(--text-muted); font-size:10px; text-transform:uppercase; letter-spacing:0.5px;">Browser download/upload</div>
-                    <a class="cfg-item" onclick="downloadTsv('provider_costs')">⬇ Provider Costs</a>
-                    <a class="cfg-item" onclick="downloadTsv('model_reference')">⬇ Model Reference</a>
-                    <a class="cfg-item" onclick="downloadTsv('provider_pru_invoices')">⬇ PRU Invoices</a>
-                    <a class="cfg-item" onclick="uploadTsv('provider_costs')">⬆ Upload Provider Costs</a>
-                    <a class="cfg-item" onclick="uploadTsv('model_reference')">⬆ Upload Model Reference</a>
-                    <a class="cfg-item" onclick="uploadTsv('provider_pru_invoices')">⬆ Upload PRU Invoices</a>
-                </div>
-                <input type="file" id="tsv-upload-input" accept=".tsv,.txt,.csv" style="display:none;" />
-            </div>
+            <button id="config-btn" onclick="toggleConfigView()" style="background: var(--card-bg); border: 1px solid var(--border); color: var(--text); padding: 6px 10px; border-radius: 4px; cursor: pointer;">⚙️ Config</button>
+            <input type="file" id="tsv-upload-input" accept=".tsv,.txt,.csv" style="display:none;" />
         </div>
     </div>
-
-    <h2>Session Details</h2>
-    <div class="timestamp">Normal cost columns are PAYG-equivalent token costs; CLI rows may be calculated from token usage. COST(Est.) remains the separate subscription/pro-rata allocation.</div>
 
     <div class="table-container">
         <table id="sessions-table">
@@ -352,14 +448,12 @@
                     <td class="num"><strong id="total-cache-write">-</strong></td>
                     <td class="num"><strong id="total-in">-</strong></td>
                     <td class="num"><strong id="total-output">-</strong></td>
-                    <td class="num"><strong id="total-tokens">-</strong></td>
-                    <td class="num hit-rate"><strong id="total-hit-rate">-</strong></td>
-                    <td class="num cost-logged col-cost"><strong id="total-cost-io">-</strong></td>
-                    <td class="num cost-logged col-cost"><strong id="total-cost-cache">-</strong></td>
+                    <td class="num col-alltok-bright"><strong id="total-tokens">-</strong></td>
+                    <td class="num" style="color: var(--text-muted); font-size: 10px; font-weight: normal;"><span id="total-hit-rate">-</span></td>
+                    <td class="num cost-sub col-cost"><strong id="total-cost-io">-</strong></td>
+                    <td class="num cost-sub col-cost"><strong id="total-cost-cache">-</strong></td>
                     <td class="num cost-logged col-cost"><strong id="total-cost">-</strong></td>
-                    <td class="num cost-logged col-mtok"><strong id="total-cost-mtok-logged"></strong></td>
-                    <td class="num col-cost"><strong id="total-cost-est">-</strong></td>
-                    <td class="num cost"><strong id="total-cost-mtok"></strong></td>
+                    <td class="num col-mtok col-mtok-shade"><strong id="total-cost-mtok-logged"></strong></td>
                 </tr>
                 <!-- Column headers -->
                 <tr>
@@ -377,27 +471,52 @@
                     <th data-sort="cache_write" class="num">Cache W</th>
                     <th data-sort="total_in" class="num">Total In</th>
                     <th data-sort="output_tokens" class="num">Output</th>
-                    <th data-sort="total_tokens" class="num">All Tokens</th>
-                    <th data-sort="hit_rate" class="num hit-rate" title="Cache hit rate: cache reads / total input tokens">Hit %</th>
-                    <th data-sort="cost_io" class="num cost-logged col-cost">PAYG I+O</th>
-                    <th data-sort="cost_cache" class="num cost-logged col-cost">PAYG Cache</th>
-                    <th data-sort="cost_logged" class="num cost-logged col-cost">PAYG Total</th>
-                    <th class="num cost-logged col-mtok">/MTOK</th>
-                    <th data-sort="cost_estimated" class="num col-cost">COST(Est.)</th>
-                    <th class="num">/MTOK</th>
+                    <th data-sort="total_tokens" class="num col-alltok-bright">All Tokens</th>
+                    <th data-sort="hit_rate" class="num" title="Cache hit rate: cache reads / total input tokens">Hit %</th>
+                    <th data-sort="cost_io" class="num cost-sub col-cost">I+O</th>
+                    <th data-sort="cost_cache" class="num cost-sub col-cost">Cache</th>
+                    <th data-sort="cost_logged" class="num cost-logged col-cost">Total</th>
+                    <th class="num col-mtok col-mtok-shade">/MTOK</th>
                 </tr>
             </thead>
             <tbody id="sessions-tbody">
-                <tr><td colspan="22" class="loading">Loading session data...</td></tr>
+                <tr><td colspan="20" class="loading">Loading session data...</td></tr>
             </tbody>
         </table>
+    </div>
+    </div>
+
+    <div id="view-config" hidden>
+        <h2 class="ref-h2">Reference Tables
+            <span class="ref-hint">provider plans · model map · PRU invoices — edited in-page, saved per table</span>
+        </h2>
+        <div class="ref-filebar">
+            <div class="ref-filebar-group">
+                <span class="ref-filebar-label">TSV files</span>
+                <button class="ref-btn" onclick="refDisk('export')">📋 Export DB → tsv</button>
+                <button class="ref-btn" onclick="refDisk('import')">📥 Import tsv → DB</button>
+            </div>
+            <div class="ref-filebar-group">
+                <span class="ref-filebar-label">Download</span>
+                <button class="ref-btn" onclick="downloadTsv('provider_pru_invoices')">PRU</button>
+                <button class="ref-btn" onclick="downloadTsv('model_reference')">Models</button>
+                <button class="ref-btn" onclick="downloadTsv('provider_costs')">Costs</button>
+            </div>
+            <div class="ref-filebar-group">
+                <span class="ref-filebar-label">Upload</span>
+                <button class="ref-btn" onclick="uploadTsv('provider_pru_invoices')">PRU</button>
+                <button class="ref-btn" onclick="uploadTsv('model_reference')">Models</button>
+                <button class="ref-btn" onclick="uploadTsv('provider_costs')">Costs</button>
+            </div>
+        </div>
+        <div class="ref-stack" id="ref-grid"></div>
     </div>
 </div>
 
 <script>
 // State
 let sessionsData = [];
-const COST_API_BASE = '/api/cost-v31';
+const COST_API_BASE = '/api/cost-v4';
 let messagesData = [];
 let messagesBySegmentCache = {}; // cacheKey -> [message, ...] loaded on demand
 let loadingDetailKeys = new Set();
@@ -407,6 +526,13 @@ let providerCostPeriods = {};  // {provider: [{billing_start, plan_type, monthly
 let providerTotalPRUs = {};  // {provider: total_PRUs} (all-time)
 let copilotOpusTokens = 0;  // legacy debug (still returned by API)
 let copilotOtherTokens = 0; // legacy debug (still returned by API)
+// ── Pioneer input override (viewer-side, NOT persisted in DB) ──────────────
+// Pioneer logs an inflated gross-prompt input count; real billable input is
+// ~1200/msg. The DB now stores RAW values; this toggle overrides the Input
+// display (and cost_input) to 1200*msgs per model, recomputed locally.
+let pioneerRatecard = {};          // {model_raw: {input,output,cache_read,cache_write}}
+let pioneerEstimateTokens = 1200;  // per-message input estimate
+let pioneerOverrides = JSON.parse(localStorage.getItem('costTrackerPioneerOverrides') || '{}'); // {model_raw: true}
 
 // Period-based cost allocation pools (built on load)
 // Structure: { provider: [ {from: Date, to: Date|null, costPool: $, totalTokens: N, totalWeighted: N, planType, monthlyCost, extraUsage}, ... ] }
@@ -539,17 +665,12 @@ function messageHasUsage(m) {
         .some(key => Number(m?.[key] || 0) > 0);
 }
 
-// Cache hit rate = cache_read / total input tokens (input + cache_read + cache_write).
-function getHitRate(cacheRead, totalIn) {
+// Cache hit rate = cache_read / total input tokens (input + cache_read + cache_write)
+function formatHitRate(cacheRead, totalIn) {
     const cr = Number(cacheRead || 0);
     const ti = Number(totalIn || 0);
-    return ti > 0 ? cr / ti : null;
-}
-
-function formatHitRate(cacheRead, totalIn) {
-    const rate = getHitRate(cacheRead, totalIn);
-    if (rate === null) return '-';
-    return (rate * 100).toFixed(1) + '%';
+    if (ti <= 0) return '-';
+    return (cr / ti * 100).toFixed(1) + '%';
 }
 
 function formatCost(n) {
@@ -557,6 +678,11 @@ function formatCost(n) {
     if (n < 0.001 && n > 0) return '<$0.001';
     if (n === 0) return '$0.000';
     return '$' + n.toFixed(3);
+}
+
+function formatPaygTotal(n) {
+    if (n === null || n === undefined) return '-';
+    return '$' + n.toFixed(4);
 }
 
 function formatCostPerMtok(n) {
@@ -620,9 +746,18 @@ function formatSessionId(id) {
 }
 
 function getDisplaySource(row) {
-    const modelRaw = row?.model_raw || '';
+    const filename = row?.filename || '';
     const source = row?.session_type || '';
-    if (modelRaw.startsWith('claude/') || modelRaw.startsWith('codex_cli/') || source === 'codex_cli') {
+    if (filename.startsWith('claude:')) {
+        if (source && !['gui', 'claude_cli'].includes(source)) {
+            return source === 'openclaw' ? 'OpenClaw' : source;
+        }
+        return 'CLI';
+    }
+    if (filename.startsWith('codex_cli:codex-home/')) {
+        return 'Codex';
+    }
+    if (filename.startsWith('codex_cli:')) {
         return 'CLI';
     }
     return source || '-';
@@ -633,6 +768,8 @@ function formatSource(row) {
     if (!source) return '-';
     const colors = {
         'CLI': '#58a6ff',
+        'Codex': '#58a6ff',
+        'OpenClaw': '#bc8cff',
         'discord': '#5865F2',
         'telegram': '#229ED9',
         'cron': '#d29922',
@@ -643,8 +780,51 @@ function formatSource(row) {
     return `<span class="type-badge" style="background:${color}20;color:${color};border:1px solid ${color}40;">${source}</span>`;
 }
 
+function encodeFilePath(path) {
+    return path.split('/').map(part => encodeURIComponent(part)).join('/');
+}
+
+function sessionFilePath(filename) {
+    if (!filename) return '';
+    if (filename.startsWith('fastbot:')) {
+        return `~/.openclaw/agents/fastbot/sessions/${filename.slice('fastbot:'.length)}`;
+    }
+    if (filename.startsWith('codex_cli:')) {
+        const appServerMatch = filename.match(/^codex_cli:codex-home\/([^/]+)\/(.+)$/);
+        if (appServerMatch) {
+            return `~/.openclaw/agents/${appServerMatch[1]}/agent/codex-home/sessions/${appServerMatch[2]}`;
+        }
+        return `~/.codex/sessions/${filename.slice('codex_cli:'.length)}`;
+    }
+    if (filename.startsWith('openclaw_sqlite:')) {
+        const agent = filename.split(':')[1] || 'main';
+        return `sqlite:${agent}`;
+    }
+    if (filename.startsWith('claude:')) {
+        return `~/.claude/projects/${filename.slice('claude:'.length)}`;
+    }
+    return `~/.openclaw/agents/main/sessions/${filename}`;
+}
+
+function sessionFileHref(filename, sessionId) {
+    const isFileBacked = filename.startsWith('codex_cli:') || filename.startsWith('claude:');
+    if (!isFileBacked && sessionId) {
+        const display = sessionFilePath(filename);
+        return `/jsonl-viewer?sid=${encodeURIComponent(sessionId)}&display=${encodeURIComponent(display)}`;
+    }
+    const path = sessionFilePath(filename);
+    return path ? `/jsonl-viewer?path=${encodeURIComponent(path)}` : '#';
+}
+
 function getDisplayChannel(row) {
     const modelRaw = row?.model_raw || '';
+    const filename = row?.filename || '';
+    if (
+        filename.startsWith('claude:') &&
+        !['CLI', 'gui', 'claude_cli'].includes(getDisplaySource(row))
+    ) {
+        return row?.channel_name || row?.parent_nickname || 'OpenClaw';
+    }
     if (modelRaw.startsWith('codex_cli/')) {
         const label = row?.parent_nickname || '';
         const labels = {
@@ -666,7 +846,7 @@ async function refreshData() {
 
     try {
         // Trigger incremental migration
-        const refreshResp = await fetch('/api/cost-v3/refresh');
+        const refreshResp = await fetch('/api/cost-v4/refresh');
         const refreshData = await refreshResp.json();
 
         if (refreshData.success) {
@@ -747,6 +927,10 @@ async function loadData() {
         providerTotalPRUs = data.provider_total_prus || {};
         copilotOpusTokens = data.copilot_opus_tokens || 0;
         copilotOtherTokens = data.copilot_other_tokens || 0;
+        pioneerRatecard = data.pioneer_ratecard || {};
+        pioneerEstimateTokens = data.pioneer_estimate_tokens || 1200;
+        applyPioneerOverrides();  // mutate rows per active per-model toggles
+        renderPioneerOverrideControls();
 
         // Build period-based cost allocation pools
         periodPools = buildPeriodPools(sessionsData, providerCostPeriods);
@@ -777,7 +961,7 @@ async function loadData() {
 
     } catch (error) {
         console.error('Load error:', error);
-        tbody.innerHTML = `<tr><td colspan="22" class="error">Error: ${error.message}</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="20" class="error">Error: ${error.message}</td></tr>`;
     }
 }
 
@@ -990,6 +1174,137 @@ function tzLocalToUtcIso(dateStr, timeStr, tz) {
     return new Date(d.getTime() + offset).toISOString();
 }
 
+// ── Pioneer input override (viewer-side) ────────────────────────────────
+function isPioneerOverrideModel(modelRaw) {
+    return !!(modelRaw && pioneerRatecard[modelRaw]);
+}
+
+// Recompute each row's Input + cost_input (+ derived totals) from the snapshot
+// of raw values, applying the 1200/msg override only where toggled on.
+// Idempotent: always works from `_pioneer_raw`, so toggling on/off is lossless.
+function applyPioneerOverrides() {
+    sessionsData.forEach(s => {
+        const modelRaw = s.model_raw;
+        if (!isPioneerOverrideModel(modelRaw)) return;
+        // Snapshot raw values once.
+        if (!s._pioneer_raw) {
+            s._pioneer_raw = {
+                input_tokens: s.input_tokens || 0,
+                total_in: s.total_in || 0,
+                total_tokens: s.total_tokens || 0,
+                cost_input: s.cost_input || 0,
+                cost_io: s.cost_io || 0,
+                cost_logged: s.cost_logged || 0,
+            };
+        }
+        const raw = s._pioneer_raw;
+        const on = !!pioneerOverrides[modelRaw];
+        if (!on) {
+            // restore raw
+            s.input_tokens = raw.input_tokens;
+            s.total_in = raw.total_in;
+            s.total_tokens = raw.total_tokens;
+            s.cost_input = raw.cost_input;
+            s.cost_io = raw.cost_io;
+            s.cost_logged = raw.cost_logged;
+            s.pioneer_overridden = false;
+            return;
+        }
+        const rate = pioneerRatecard[modelRaw];
+        const msgs = s.msg_count || 0;
+        const newInput = pioneerEstimateTokens * msgs;
+        const newCostInput = newInput * (rate.input || 0) / 1e6;
+        const dInput = newInput - raw.input_tokens;
+        const dCostInput = newCostInput - raw.cost_input;
+        s.input_tokens = newInput;
+        s.total_in = raw.total_in + dInput;
+        s.total_tokens = raw.total_tokens + dInput;
+        s.cost_input = newCostInput;
+        s.cost_io = raw.cost_io + dCostInput;
+        s.cost_logged = raw.cost_logged + dCostInput;
+        s.pioneer_overridden = true;
+    });
+    // periodPools depend on token totals; rebuild for correct EST allocation.
+    try { periodPools = buildPeriodPools(sessionsData, providerCostPeriods); } catch (e) {}
+}
+
+function renderPioneerOverrideControls() {
+    const list = document.getElementById('pioneer-override-list');
+    if (!list) return;
+    const models = Object.keys(pioneerRatecard).sort();
+    if (!models.length) {
+        list.innerHTML = '<div style="padding:4px 12px; color:var(--text-muted); font-size:11px;">No Pioneer models</div>';
+        updatePioneerOverrideSummary();
+        return;
+    }
+    list.innerHTML = models.map(m => {
+        const checked = pioneerOverrides[m] ? 'checked' : '';
+        const short = m.replace('pioneer/', '');
+        return `<label style="display:flex; align-items:center; gap:8px; padding:4px 12px; cursor:pointer; font-size:12px; white-space:nowrap;">
+            <input type="checkbox" ${checked} onchange="setPioneerOverride('${m}', this.checked)" />
+            ${short}
+        </label>`;
+    }).join('');
+    updatePioneerOverrideSummary();
+}
+
+function updatePioneerOverrideSummary() {
+    const el = document.getElementById('pioneer-override-summary');
+    if (!el) return;
+    const models = Object.keys(pioneerRatecard);
+    const onCount = models.filter(m => pioneerOverrides[m]).length;
+    if (onCount === 0) el.textContent = 'raw';
+    else if (onCount === models.length && models.length > 0) el.textContent = '1200 all';
+    else el.textContent = `1200 ×${onCount}`;
+    const btn = document.getElementById('pioneer-override-btn');
+    if (btn) btn.style.borderColor = onCount ? '#4CAF50' : 'var(--border)';
+}
+
+function persistPioneerOverrides() {
+    localStorage.setItem('costTrackerPioneerOverrides', JSON.stringify(pioneerOverrides));
+}
+
+function refreshAfterPioneerChange() {
+    applyPioneerOverrides();
+    updatePioneerOverrideSummary();
+    try { updateTotals(); } catch (e) {}
+    try { renderTable(); updateGroupIndicators(); } catch (e) {}
+}
+
+function setPioneerOverride(modelRaw, on) {
+    if (on) pioneerOverrides[modelRaw] = true;
+    else delete pioneerOverrides[modelRaw];
+    persistPioneerOverrides();
+    refreshAfterPioneerChange();
+}
+
+function setAllPioneerOverrides(on) {
+    pioneerOverrides = {};
+    if (on) Object.keys(pioneerRatecard).forEach(m => { pioneerOverrides[m] = true; });
+    persistPioneerOverrides();
+    renderPioneerOverrideControls();
+    refreshAfterPioneerChange();
+}
+
+function togglePioneerMenu(event) {
+    if (event) event.stopPropagation();
+    const menu = document.getElementById('pioneer-override-menu');
+    if (!menu) return;
+    const showing = menu.style.display === 'block';
+    menu.style.display = showing ? 'none' : 'block';
+    if (!showing) {
+        setTimeout(() => {
+            const close = (e) => {
+                if (!menu.contains(e.target) && e.target.id !== 'pioneer-override-btn') {
+                    menu.style.display = 'none';
+                    document.removeEventListener('click', close);
+                }
+            };
+            document.addEventListener('click', close);
+        }, 0);
+    }
+}
+
 function updateTotals() {
     const filtered = getFilteredData();
 
@@ -1025,14 +1340,11 @@ function updateTotals() {
     document.getElementById('total-hit-rate').textContent = formatHitRate(totalCacheRead, totalIn);
     document.getElementById('total-cost-io').textContent = formatCost(totalCostIO);
     document.getElementById('total-cost-cache').textContent = formatCost(totalCostCache);
-    document.getElementById('total-cost').textContent = formatCost(totalCost);
-    document.getElementById('total-cost-est').textContent = formatCost(totalCostEst);
+    document.getElementById('total-cost').textContent = formatPaygTotal(totalCost);
 
     const mtok = totalTokens ? (totalTokens / 1e6) : 0;
     const costPerMtokLogged = mtok > 0 ? (totalCost / mtok) : null;
-    const costPerMtokEst = mtok > 0 ? (totalCostEst / mtok) : null;
     document.getElementById('total-cost-mtok-logged').textContent = formatCostPerMtok(costPerMtokLogged);
-    document.getElementById('total-cost-mtok').textContent = formatCostPerMtok(costPerMtokEst);
 }
 
 // NOTE: `segment.endpoint` is a *display alias* (user-controlled in model_reference).
@@ -1317,7 +1629,10 @@ function renderTable() {
 
     const getSortValue = (row, col) => {
         if (col === 'last_msg_ts') return row.last_msg_ts || row.first_msg_ts || row.created_at;
-        if (col === 'hit_rate') return getHitRate(row.cache_read, row.total_in);
+        if (col === 'hit_rate') {
+            const ti = Number(row.total_in || 0);
+            return ti > 0 ? Number(row.cache_read || 0) / ti : null;
+        }
         return row[col];
     };
 
@@ -1342,7 +1657,7 @@ function renderTable() {
     });
 
     if (filtered.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="22" style="color: var(--text-muted); text-align: center; padding: 20px;">No sessions match filters</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="20" style="color: var(--text-muted); text-align: center; padding: 20px;">No sessions match filters</td></tr>';
         return;
     }
 
@@ -1362,8 +1677,7 @@ function renderTable() {
             statusIcon = `<span class="trash-icon" title="${t}">🗑️</span>`;
         }
 
-        const sessionLogRawUrl = (!isGrouped && s.session_id) ? `/session-log/${encodeURIComponent(s.session_id)}` : '';
-        const sessionLogUrl = sessionLogRawUrl ? `/jsonl-viewer?url=${encodeURIComponent(sessionLogRawUrl)}` : '';
+        const fileHref = (!isGrouped && filename) ? sessionFileHref(filename, s.session_id) : '#';
         const rowId = isGrouped ? s.session_id : `${s.session_id}__${s.model_raw}__${s.segment_index}`;
         const isExpanded = (!isGrouped) && expandedSessions.has(rowId);
         const expanderHtml = isGrouped ? '' : `<span class="expander" onclick="toggleDetails(event, '${rowId}')">${isExpanded ? '[-]' : '[+]'}</span>`;
@@ -1371,17 +1685,16 @@ function renderTable() {
         const costEst = isGrouped ? (s.cost_estimated || 0) : calculateCostEst(s);
         const mtok = (s.total_tokens || 0) / 1e6;
         const costPerMtokLogged = mtok > 0 ? ((s.cost_logged || 0) / mtok) : null;
-        const costPerMtokEst = mtok > 0 ? (costEst / mtok) : null;
         const displayChannel = getDisplayChannel(s);
 
         // Session row
         rows.push(`
-        <tr class="session-row" data-rowid="${rowId}" data-session-log-url="${sessionLogUrl}">
+        <tr class="session-row" data-rowid="${rowId}">
             <td class="date" style="padding-left: 4px; width: 20px;">${expanderHtml}</td>
             <td class="date" style="padding-right: 2px;">${formatDate(s.first_msg_ts || s.created_at)}</td>
             <td class="date" style="color: var(--text-muted); padding-left: 2px;">${formatLastTime(s.first_msg_ts || s.created_at, s.last_msg_ts)}</td>
             <td class="num" style="width: 30px;">${s.msg_count || 0}</td>
-            <td class="id-cell" style="width: 36px;"><a href="#" class="id-link" title="${filename || s.session_id || '-'}">${s.session_nickname || formatSessionId(s.session_id)}</a>${statusIcon}</td>
+            <td class="id-cell" style="width: 36px;"><a href="${fileHref}" target="_blank" rel="noopener" class="id-link" title="${filename || s.session_id || '-'}">${s.session_nickname || formatSessionId(s.session_id)}</a>${statusIcon}</td>
             <td>${formatSource(s)}</td>
             <td class="channel" title="${displayChannel}">${displayChannel}</td>
             <td class="endpoint">${s.endpoint || '-'}</td>
@@ -1391,14 +1704,12 @@ function renderTable() {
             <td class="num">${formatTokens(s.cache_write)}</td>
             <td class="num">${formatTokens(s.total_in)}</td>
             <td class="num">${formatTokens(s.output_tokens)}</td>
-            <td class="num">${formatTokens(s.total_tokens)}</td>
-            <td class="num hit-rate">${formatHitRate(s.cache_read, s.total_in)}</td>
-            <td class="num cost-logged col-cost">${formatCost(s.cost_io)}</td>
-            <td class="num cost-logged col-cost">${formatCost(s.cost_cache)}</td>
-            <td class="num cost-logged col-cost">${formatCost(s.cost_logged)}</td>
-            <td class="num cost-logged col-mtok">${formatCostPerMtok(costPerMtokLogged)}</td>
-            <td class="num cost col-cost">${formatCost(costEst)}</td>
-            <td class="num cost">${formatCostPerMtok(costPerMtokEst)}</td>
+            <td class="num col-alltok-bright">${formatTokens(s.total_tokens)}</td>
+            <td class="num" style="color: var(--text-muted); font-size: 10px;">${formatHitRate(s.cache_read, s.total_in)}</td>
+            <td class="num cost-sub col-cost">${formatCost(s.cost_io)}</td>
+            <td class="num cost-sub col-cost">${formatCost(s.cost_cache)}</td>
+            <td class="num cost-logged col-cost">${formatPaygTotal(s.cost_logged)}</td>
+            <td class="num col-mtok col-mtok-shade">${formatCostPerMtok(costPerMtokLogged)}</td>
         </tr>
         `);
 
@@ -1409,20 +1720,20 @@ function renderTable() {
             if (!cached) {
                 rows.push(`
                 <tr class="detail-row" data-parent="${rowId}" style="background: rgba(88, 166, 255, 0.03);">
-                    <td colspan="22" style="padding-left: 24px; color: var(--text-muted); font-size: 11px;">Loading messages...</td>
+                    <td colspan="20" style="padding-left: 24px; color: var(--text-muted); font-size: 11px;">Loading messages...</td>
                 </tr>
                 `);
                 loadSegmentMessages(s, rowId, detailKey);
             } else if (cached.error) {
                 rows.push(`
                 <tr class="detail-row" data-parent="${rowId}" style="background: rgba(248, 81, 73, 0.08);">
-                    <td colspan="22" style="padding-left: 24px; color: var(--red); font-size: 11px;">Message load failed: ${cached.error}</td>
+                    <td colspan="20" style="padding-left: 24px; color: var(--red); font-size: 11px;">Message load failed: ${cached.error}</td>
                 </tr>
                 `);
             } else if (cached.length === 0) {
                 rows.push(`
                 <tr class="detail-row" data-parent="${rowId}" style="background: rgba(88, 166, 255, 0.03);">
-                    <td colspan="22" style="padding-left: 24px; color: var(--text-muted); font-size: 11px;">No messages in this segment/window</td>
+                    <td colspan="20" style="padding-left: 24px; color: var(--text-muted); font-size: 11px;">No messages in this segment/window</td>
                 </tr>
                 `);
             } else {
@@ -1442,13 +1753,11 @@ function renderTable() {
                     <td class="num" style="color: var(--text-muted);">${formatTokens(m.input_tokens + m.cache_read + m.cache_write)}</td>
                     <td class="num" style="color: var(--text-muted);">${formatTokens(m.output_tokens)}</td>
                     <td class="num" style="color: var(--text-muted);">${formatTokens(m.total_tokens)}</td>
-                    <td class="num hit-rate">${formatHitRate(m.cache_read, m.input_tokens + m.cache_read + m.cache_write)}</td>
-                    <td class="num" style="color: var(--cost-logged);">${formatCost(m.cost_input + m.cost_output)}</td>
-                    <td class="num" style="color: var(--cost-logged);">${formatCost(m.cost_cache_read + m.cost_cache_write)}</td>
-                    <td class="num" style="color: var(--cost-logged);">${formatCost(m.cost_total)}</td>
-                    <td class="num" style="color: var(--cost-logged);">${m.total_tokens ? formatCostPerMtok((m.cost_total || 0) / ((m.total_tokens || 0) / 1e6)) : ''}</td>
-                    <td class="num" style="color: var(--text-muted);">-</td>
-                    <td class="num" style="color: var(--text-muted);">-</td>
+                    <td class="num" style="color: var(--text-muted); font-size: 10px;">${formatHitRate(m.cache_read, m.input_tokens + m.cache_read + m.cache_write)}</td>
+                    <td class="num cost-sub">${formatCost(m.cost_input + m.cost_output)}</td>
+                    <td class="num cost-sub">${formatCost(m.cost_cache_read + m.cost_cache_write)}</td>
+                    <td class="num" style="color: var(--cost-logged);">${formatPaygTotal(m.cost_total)}</td>
+                    <td class="num" style="color: var(--text-muted);">${m.total_tokens ? formatCostPerMtok((m.cost_total || 0) / ((m.total_tokens || 0) / 1e6)) : ''}</td>
                 </tr>
                 `);
             });
@@ -1459,16 +1768,6 @@ function renderTable() {
     tbody.innerHTML = rows.join('');
     updateGroupIndicators();
 
-    // Add click handlers for opening session files
-    document.querySelectorAll('.id-link').forEach(a => {
-        a.addEventListener('click', (ev) => {
-            ev.preventDefault();
-            const tr = ev.target.closest('tr');
-            const url = (tr && tr.dataset) ? tr.dataset.sessionLogUrl : '';
-            if (!url) return;
-            window.open(url, '_blank', 'noopener');
-        });
-    });
 }
 
 function toggleDetails(event, rowId) {
@@ -1580,7 +1879,6 @@ const CONFIG_TABLE_COLS = {
 };
 
 async function refDisk(action) {
-    document.getElementById('config-menu').style.display = 'none';
     try {
         const resp = await fetch(`/api/cost-v3/ref-disk/${action}`);
         const data = await resp.json();
@@ -1595,21 +1893,24 @@ async function refDisk(action) {
     }
 }
 
-function toggleConfigMenu() {
-    const menu = document.getElementById('config-menu');
-    menu.style.display = menu.style.display === 'none' ? 'block' : 'none';
-}
-// Close menu on outside click
-document.addEventListener('click', (e) => {
-    const menu = document.getElementById('config-menu');
+function toggleConfigView(force) {
+    buildRefPanels();
+    const main = document.getElementById('view-main');
+    const cfg = document.getElementById('view-config');
     const btn = document.getElementById('config-btn');
-    if (menu && !menu.contains(e.target) && e.target !== btn) {
-        menu.style.display = 'none';
+    const show = (force === undefined) ? cfg.hidden : !!force;
+    cfg.hidden = !show;
+    main.hidden = show;
+    btn.textContent = show ? '← Data' : '⚙️ Config';
+    if (show) {
+        for (const t of REF_ORDER) { if (!refState[t]) refLoad(t); }
+        window.scrollTo({ top: 0, behavior: 'smooth' });
     }
-});
+}
+// Back-compat alias used by the geometry gate.
+function toggleRefEditor(force) { return toggleConfigView(force); }
 
 async function downloadTsv(table) {
-    document.getElementById('config-menu').style.display = 'none';
     try {
         const resp = await fetch(`/api/cost-v3/ref/${table}`);
         if (!resp.ok) throw new Error('API error ' + resp.status);
@@ -1638,7 +1939,6 @@ async function downloadTsv(table) {
 
 let pendingUploadTable = null;
 function uploadTsv(table) {
-    document.getElementById('config-menu').style.display = 'none';
     pendingUploadTable = table;
     const input = document.getElementById('tsv-upload-input');
     input.value = '';
@@ -1698,6 +1998,402 @@ document.getElementById('tsv-upload-input').addEventListener('change', async (e)
         alert('Upload failed: ' + err.message);
     }
 });
+
+// ── Reference tables in-page editor · build 2026.07.30.1 ─────────────
+const REF_TABLES = {
+    provider_costs: {
+        title: 'Provider Costs', wide: false,
+        saveHint: 'run \u27F3 Refresh to recalculate PAYG costs',
+        cols: [
+            { k: 'provider', label: 'Provider', w: '26%' },
+            { k: 'billing_start', label: 'Start', w: '78px' },
+            { k: 'plan_type', label: 'Plan', w: '106px', select: ['flat', 'flat_plus_usage', 'payg', 'free', 'free_trial'] },
+            { k: 'monthly_cost', label: '$/mo', w: '56px', num: true },
+            { k: 'extra_usage', label: 'Extra', w: '56px', num: true },
+            { k: 'notes', label: 'Notes', w: '' },
+        ],
+    },
+    model_reference: {
+        title: 'Model Reference', wide: false, saveHint: null,
+        cols: [
+            { k: 'model_raw', label: 'model_raw', w: '32%' },
+            { k: 'endpoint', label: 'Endpoint', w: '88px' },
+            { k: 'author', label: 'Author', w: '72px' },
+            { k: 'model', label: 'Model', w: '', ro: true, derived: 'model_raw' },
+            { k: 'pru_multiplier', label: 'PRU', w: '46px', num: true },
+        ],
+    },
+    payg_model_rates: {
+        title: 'Token Rates (payg_model_rates.tsv)', wide: false,
+        saveHint: 'file-backed; run \u27F3 Refresh to reprice segments',
+        cols: [
+            { k: 'model_raw', label: 'model_raw', w: '32%' },
+            { k: 'input_per_mtok', label: 'In $/M', w: '52px', num: true },
+            { k: 'output_per_mtok', label: 'Out $/M', w: '52px', num: true },
+            { k: 'cache_read_per_mtok', label: 'CRead $/M', w: '60px', num: true },
+            { k: 'cache_write_per_mtok', label: 'CWrite $/M', w: '60px', num: true },
+            { k: 'notes', label: 'Notes', w: '' },
+        ],
+    },
+    provider_pru_invoices: {
+        title: 'PRU Invoices', wide: true, saveHint: null,
+        cols: [
+            { k: 'provider', label: 'Provider', w: '96px' },
+            { k: 'cycle_start', label: 'Cycle Start', w: '82px' },
+            { k: 'cycle_end', label: 'Cycle End', w: '82px' },
+            { k: 'model_raw', label: 'model_raw', w: '' },
+            { k: 'prus', label: 'PRUs', w: '56px', num: true },
+            { k: 'included_requests', label: 'Incl Req', w: '66px', num: true },
+            { k: 'billed_requests', label: 'Billed Req', w: '66px', num: true },
+            { k: 'notes', label: 'Notes', w: '18%' },
+        ],
+    },
+};
+const REF_ORDER = ['provider_pru_invoices', 'payg_model_rates', 'model_reference', 'provider_costs'];
+const REF_REQUIRED = {
+    provider_costs: ['provider', 'billing_start'],
+    model_reference: ['model_raw'],
+    provider_pru_invoices: ['provider', 'cycle_start', 'model_raw'],
+    payg_model_rates: ['model_raw'],
+};
+const refState = {};   // table -> { rows, orig }
+let refToastWrap = null;
+
+function refToast(msg, kind) {
+    if (!refToastWrap) {
+        refToastWrap = document.createElement('div');
+        refToastWrap.className = 'ref-toast-wrap';
+        document.body.appendChild(refToastWrap);
+    }
+    const el = document.createElement('div');
+    el.className = 'ref-toast' + (kind === 'err' ? ' ref-toast--err' : kind === 'ok' ? ' ref-toast--ok' : '');
+    el.textContent = msg;
+    refToastWrap.appendChild(el);
+    requestAnimationFrame(() => el.classList.add('ref-toast-show'));
+    setTimeout(() => {
+        el.classList.remove('ref-toast-show');
+        setTimeout(() => el.remove(), 250);
+    }, kind === 'err' ? 7000 : 3800);
+}
+
+function projectRefRow(table, row) {
+    const out = {};
+    for (const col of REF_TABLES[table].cols) {
+        const v = row[col.k];
+        out[col.k] = (v === undefined || v === null) ? null : v;
+    }
+    return out;
+}
+
+function refSnapshot(table, rows) {
+    return JSON.stringify(rows.map(r => projectRefRow(table, r)));
+}
+
+const REF_COL_CAP = { model_raw: 46, notes: 40, provider: 22, endpoint: 16, author: 14, model: 22 };
+function jsCanonical(raw) {
+    if (!raw) return '';
+    let model = raw.includes('/') ? raw.split('/').slice(1).join('/') : raw;
+    model = model.includes('/') ? model.split('/').pop() : model;
+    let lower = model.trim().toLowerCase();
+    if (lower.startsWith('claude-')) lower = lower.slice(7);
+    lower = lower.replace(/^(opus|sonnet|haiku|fable)-(\d+)-(\d+)(.*)$/, '$1-$2.$3$4');
+    if (lower.startsWith('kimi-for-coding')) return lower;
+    const kimi = lower.replace(/^kimi-/, '');
+    if (/(?:^|-)k?2(?:p|[.-])?5(?:-|$)/.test(kimi) || kimi === 'k2p5') return 'k2.5';
+    if (/(?:^|-)k?2(?:p|[.-])?6(?:-|$)/.test(kimi) || kimi === 'k2p6') return 'k2.6';
+    if (/(?:^|-)k?2(?:p|[.-])?7(?:-|$)/.test(kimi) || kimi === 'k2p7') return 'k2.7';
+    if (/(?:^|-)k?3(?:-|$)/.test(kimi)) return 'k3';
+    if (kimi.startsWith('k2')) return 'k2';
+    return lower;
+}
+function refBaseSize(table, col) {
+    const cap = REF_COL_CAP[col.k] || (col.num ? 8 : 20);
+    const min = col.num ? 5 : 4;
+    let m = col.label.length;
+    const st = refState[table];
+    if (st) for (const r of st.rows) {
+        const val = r[col.k];
+        if (val !== null && val !== undefined) m = Math.max(m, String(val).length);
+    }
+    return Math.min(Math.max(m + 1, min), cap);
+}
+function refInputSize(col, value, base) {
+    const cap = REF_COL_CAP[col.k] || (col.num ? 8 : 20);
+    const min = col.num ? 5 : 4;
+    const len = (value === null || value === undefined) ? 0 : String(value).length;
+    // Hard ceiling at `cap`: a value longer than the cap scrolls *inside* the
+    // cell rather than stretching the column (and the table) past the panel.
+    return Math.min(Math.max(len + 1, base, min), cap);
+}
+function refParseValue(col, v) {
+    v = String(v).trim();
+    if (!col.num) return v === '' ? null : v;
+    if (v === '') return null;
+    const n = parseFloat(v);
+    return Number.isFinite(n) ? n : 0;
+}
+
+function buildRefPanels() {
+    const grid = document.getElementById('ref-grid');
+    if (grid.childElementCount) return;
+    for (const table of REF_ORDER) {
+        const meta = REF_TABLES[table];
+        const panel = document.createElement('div');
+        panel.className = 'ref-panel';
+        panel.id = 'ref-panel-' + table;
+
+        const head = document.createElement('div');
+        head.className = 'ref-panel-head';
+        const dot = document.createElement('span');
+        dot.className = 'ref-dot'; dot.title = 'Unsaved changes';
+        const name = document.createElement('span');
+        name.className = 'ref-panel-name'; name.textContent = meta.title;
+        const count = document.createElement('span');
+        count.className = 'ref-rowcount'; count.id = 'ref-count-' + table; count.textContent = '\u2014';
+        const actions = document.createElement('span');
+        actions.className = 'ref-head-actions';
+        const addBtn = document.createElement('button');
+        addBtn.className = 'ref-btn'; addBtn.title = 'Add row'; addBtn.textContent = '+';
+        addBtn.addEventListener('click', () => refAddRow(table));
+        const reloadBtn = document.createElement('button');
+        reloadBtn.className = 'ref-btn'; reloadBtn.title = 'Reload from DB (discards edits)'; reloadBtn.textContent = '\u21BA';
+        reloadBtn.addEventListener('click', () => refReload(table));
+        const saveBtn = document.createElement('button');
+        saveBtn.className = 'ref-btn ref-btn-save'; saveBtn.id = 'ref-save-' + table;
+        saveBtn.textContent = 'Save'; saveBtn.disabled = true;
+        saveBtn.addEventListener('click', () => refSave(table));
+        actions.append(addBtn, reloadBtn, saveBtn);
+        head.append(dot, name, count, actions);
+
+        const scroll = document.createElement('div');
+        scroll.className = 'ref-scroll';
+        const tbl = document.createElement('table');
+        tbl.className = 'ref-table';
+        const thead = document.createElement('thead');
+        const hr = document.createElement('tr');
+        hr.appendChild(document.createElement('th'));
+        for (const c of meta.cols) {
+            const th = document.createElement('th');
+            th.textContent = c.label; th.title = c.k;
+            hr.appendChild(th);
+        }
+        thead.appendChild(hr);
+        const tbody = document.createElement('tbody');
+        tbody.id = 'ref-body-' + table;
+        tbl.append(thead, tbody);
+        scroll.appendChild(tbl);
+        panel.append(head, scroll);
+        grid.appendChild(panel);
+    }
+}
+
+// 2026.07.30.2: the old collapsible opener is superseded by the alias above
+// (-> toggleConfigView, which flips the dedicated config view). This is now a
+// dead stub (early return); its body is left verbatim only to avoid rewriting
+// an escaped-unicode string. Harmless: never called, never reached.
+function _removedToggleRefEditor_20260730(force) { return;
+    const show = (force === undefined) ? root.hidden : !!force;
+    root.hidden = !show;
+    btn.textContent = show ? '\u25BE close editor' : '\u25B8 open editor';
+    if (show) {
+        for (const t of Object.keys(REF_TABLES)) {
+            if (!refState[t]) refLoad(t);
+        }
+        root.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+}
+
+async function refLoad(table) {
+    const countEl = document.getElementById('ref-count-' + table);
+    countEl.textContent = 'loading\u2026';
+    try {
+        const resp = await fetch(`/api/cost-v3/ref/${table}`);
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const data = await resp.json();
+        const rows = data.rows || [];
+        refState[table] = { rows: rows, orig: refSnapshot(table, rows) };
+        renderRefTable(table);
+    } catch (e) {
+        countEl.textContent = 'error';
+        refToast(`Failed to load ${table}: ${e.message}`, 'err');
+    }
+}
+
+function renderRefTable(table) {
+    const meta = REF_TABLES[table];
+    const st = refState[table];
+    const tbody = document.getElementById('ref-body-' + table);
+    tbody.innerHTML = '';
+    if (!st) return;
+    if (!st.rows.length) {
+        const tr = document.createElement('tr');
+        const td = document.createElement('td');
+        td.colSpan = meta.cols.length + 1;
+        td.className = 'ref-empty';
+        td.textContent = 'no rows \u2014 click + to add one';
+        tr.appendChild(td);
+        tbody.appendChild(tr);
+    }
+    st.rows.forEach((row, i) => {
+        const tr = document.createElement('tr');
+        const tdDel = document.createElement('td');
+        const del = document.createElement('button');
+        del.className = 'ref-del';
+        del.textContent = '\u00D7';
+        del.title = 'Delete row';
+        del.addEventListener('click', () => refDeleteRow(table, i));
+        tdDel.appendChild(del);
+        tr.appendChild(tdDel);
+        meta.cols.forEach(col => {
+            const td = document.createElement('td');
+            if (col.ro) {
+                const span = document.createElement('span');
+                span.className = 'ref-cell ref-derived';
+                if (col.derived) {
+                    span.dataset.src = col.derived;
+                    span.textContent = jsCanonical(row[col.derived] || '');
+                } else {
+                    span.textContent = (row[col.k] === null || row[col.k] === undefined) ? '' : String(row[col.k]);
+                }
+                td.appendChild(span);
+                tr.appendChild(td);
+                return;
+            }
+            let ctl;
+            if (col.select) {
+                ctl = document.createElement('select');
+                ctl.className = 'ref-cell ref-cell--select';
+                const cur = (row[col.k] === null || row[col.k] === undefined) ? '' : String(row[col.k]);
+                if (!cur) {
+                    const blank = document.createElement('option');
+                    blank.value = ''; blank.textContent = '';
+                    ctl.appendChild(blank);
+                }
+                for (const o of col.select) {
+                    const op = document.createElement('option');
+                    op.value = o; op.textContent = o;
+                    ctl.appendChild(op);
+                }
+                ctl.value = cur;
+                ctl.addEventListener('change', () => {
+                    row[col.k] = refParseValue(col, ctl.value);
+                    refSetDirty(table);
+                });
+            } else {
+                ctl = document.createElement('input');
+                ctl.className = 'ref-cell' + (col.num ? ' ref-num' : '');
+                ctl.type = 'text';
+                if (col.num) ctl.inputMode = 'decimal';
+                ctl.spellcheck = false;
+                ctl.value = (row[col.k] === null || row[col.k] === undefined) ? '' : String(row[col.k]);
+                const baseSize = refBaseSize(table, col);
+                const applySize = () => { ctl.size = refInputSize(col, ctl.value, baseSize); };
+                applySize();
+                ctl.addEventListener('keydown', (e) => {
+                    if (e.key === 'Enter' || e.key === 'Escape') ctl.blur();
+                });
+                ctl.addEventListener('input', () => {
+                    row[col.k] = refParseValue(col, ctl.value);
+                    applySize();
+                    refSetDirty(table);
+                    const ds = tr.querySelector(`.ref-derived[data-src="${col.k}"]`);
+                    if (ds) ds.textContent = jsCanonical(ctl.value);
+                });
+            }
+            td.appendChild(ctl);
+            tr.appendChild(td);
+        });
+        tbody.appendChild(tr);
+    });
+    refSetDirty(table);
+}
+
+function refSetDirty(table) {
+    const st = refState[table];
+    if (!st) return;
+    const dirty = refSnapshot(table, st.rows) !== st.orig;
+    document.getElementById('ref-panel-' + table).classList.toggle('ref-dirty', dirty);
+    const save = document.getElementById('ref-save-' + table);
+    save.disabled = !dirty;
+    save.classList.toggle('ref-save-ready', dirty);
+    const n = st.rows.length;
+    document.getElementById('ref-count-' + table).textContent = `${n} row${n === 1 ? '' : 's'}`;
+}
+
+function refAddRow(table) {
+    const st = refState[table];
+    if (!st) return;
+    st.rows.push({});
+    renderRefTable(table);
+    const tbody = document.getElementById('ref-body-' + table);
+    const first = tbody.querySelector('tr:last-child input, tr:last-child select');
+    if (first) first.focus();
+}
+
+function refDeleteRow(table, idx) {
+    const st = refState[table];
+    if (!st) return;
+    st.rows.splice(idx, 1);
+    renderRefTable(table);
+}
+
+async function refReload(table) {
+    const st = refState[table];
+    if (st && refSnapshot(table, st.rows) !== st.orig) {
+        if (!confirm(`Discard unsaved edits to ${REF_TABLES[table].title}?`)) return;
+    }
+    await refLoad(table);
+}
+
+async function refSave(table) {
+    const meta = REF_TABLES[table];
+    const st = refState[table];
+    if (!st) return;
+    const rows = st.rows.map(r => projectRefRow(table, r));
+    const required = REF_REQUIRED[table] || [];
+    for (let i = 0; i < rows.length; i++) {
+        const missing = required.filter(c => !rows[i][c] || !String(rows[i][c]).trim());
+        if (missing.length) {
+            refToast(`${meta.title} row ${i + 1}: missing ${missing.join(', ')}`, 'err');
+            return;
+        }
+    }
+    let deleted = [];
+    if (table === 'model_reference') {
+        const origRows = JSON.parse(st.orig || '[]');
+        const current = new Set(rows.map(r => r.model_raw));
+        deleted = origRows.map(r => r.model_raw).filter(m => m && !current.has(m));
+    }
+    const saveBtn = document.getElementById('ref-save-' + table);
+    saveBtn.disabled = true;
+    saveBtn.textContent = 'Saving\u2026';
+    try {
+        const resp = await fetch(`/api/cost-v3/ref/${table}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ rows, deleted }),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok || data.error) throw new Error(data.error || ('HTTP ' + resp.status));
+        let msg = `Saved ${data.saved} rows \u2192 ${table}`;
+        if (data.deleted) msg += ` \u00B7 deleted ${data.deleted}`;
+        if (meta.saveHint) msg += ` \u00B7 ${meta.saveHint}`;
+        refToast(msg, 'ok');
+        if (data.refused && data.refused.length) {
+            refToast('Not deleted (still referenced by usage history): ' +
+                data.refused.map(r => `${r.model_raw} (${r.messages} msgs)`).join(', '), 'err');
+            await refLoad(table);  // resync: server kept the refused rows
+        } else {
+            st.orig = refSnapshot(table, st.rows);
+        }
+        if (table === 'model_reference') loadData();
+    } catch (e) {
+        refToast(`Save failed for ${table}: ${e.message}`, 'err');
+    } finally {
+        saveBtn.textContent = 'Save';
+        refSetDirty(table);
+    }
+}
 </script>
 </body>
 </html>

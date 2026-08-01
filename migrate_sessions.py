@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Migration script for AI Cost Tracker v3.
-Parses OpenClaw and Codex CLI session logs and populates SQLite database.
+Parses OpenClaw session logs and populates SQLite database.
 
 Usage:
     python3 migrate_sessions.py [--full] [--incremental]
@@ -9,6 +9,8 @@ Usage:
     --full        Rebuild entire database from scratch
     --incremental Only add new sessions (default)
 """
+
+from __future__ import annotations
 
 import argparse
 import sqlite3
@@ -21,24 +23,74 @@ import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-# Paths / runtime-configurable inputs
+# Paths
 SCRIPT_DIR = Path(__file__).resolve().parent
-DB_PATH = SCRIPT_DIR / "cost_tracker.db"
+DB_PATH = Path(os.environ.get("COST_TRACKER_DB_PATH", SCRIPT_DIR / "cost_tracker.db"))
 SESSIONS_DIR = Path.home() / ".openclaw" / "agents" / "main" / "sessions"
+SESSIONS_INDEX_PATH = SESSIONS_DIR / "sessions.json"
 CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
+OPENCLAW_AGENTS_DIR = Path.home() / ".openclaw" / "agents"
+OPENCLAW_SESSION_SOURCES = []
+CODEX_SESSION_SOURCE = {"key": "codex_cli", "label": "Codex CLI", "dir": CODEX_SESSIONS_DIR}
+KIMI_CODE_DIR = Path.home() / ".kimi-code"
+KIMI_SESSION_SOURCE = {"key": "kimi_code", "label": "Kimi Code", "dir": KIMI_CODE_DIR}
+
+# Codex app-server (OpenClaw harness) homes. OpenClaw runs the app-server with
+# CODEX_HOME=<agent>/agent/codex-home, so its rollout-*.jsonl transcripts do NOT
+# land in the classic ~/.codex/sessions tree. These rollouts carry the real
+# per-turn token usage (event_msg/token_count) that OpenClaw session logs mostly
+# record as zeros, so they are the authoritative usage source for codex-harness
+# turns.
+CODEX_HOME_GLOB = OPENCLAW_AGENTS_DIR
+
+# Rollout ingestion from agent codex-home dirs. Added 2026-07-24 because
+# OpenClaw session storage does not yet contain complete usage for every
+# codex-harness turn. OpenClaw 7.2 records substantially more real usage, but
+# measured 2026-07-30 coverage is still incomplete. Keep both sources enabled;
+# reconcile_usage_duplicates() excludes only proved one-to-one twins.
+CODEX_HOME_INGEST_ENABLED = True
+
+def codex_app_server_roots():
+    """Return [{'agent': name, 'dir': sessions-dir}] for each agent codex-home."""
+    roots = []
+    if not CODEX_HOME_INGEST_ENABLED:
+        return roots
+    if CODEX_HOME_GLOB.exists():
+        for agent_dir in sorted(CODEX_HOME_GLOB.iterdir()):
+            sessions = agent_dir / "agent" / "codex-home" / "sessions"
+            if sessions.is_dir():
+                roots.append({"agent": agent_dir.name, "dir": sessions})
+    return roots
+
+def codex_app_server_root_for(filepath):
+    """Return the codex-home root dict containing filepath, else None."""
+    fp = Path(filepath).resolve()
+    for root in codex_app_server_roots():
+        try:
+            fp.relative_to(root["dir"].resolve())
+            return root
+        except ValueError:
+            continue
+    return None
+CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 CHANNEL_MAPPING_PATH = None
 BACKUPS_DIR = SCRIPT_DIR / "backups"
+CODEX_THREAD_ID_CACHE_PATH = SCRIPT_DIR / ".codex_thread_id_cache.json"
+CODEX_APP_SERVER_IDEMPOTENCY_RE = re.compile(
+    r"^codex-app-server:"
+    r"(?P<thread_id>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}):"
+    r"(?P<turn_id>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}):"
+    r"(?P<role>user|assistant):(?P<index>\d+)$"
+)
+_OPENCLAW_CODEX_THREAD_IDS_CACHE = None
+_OPENCLAW_SESSION_INDEX_CACHE = None
 
 CHANNEL_MAPPING = {"channels": {}}
 CHANNEL_ID_TO_NAME = {}
 
 
-def load_channel_mapping(path: Path | None):
-    """Load optional channel ID → name mappings.
-
-    The tracker works without this file. When omitted, channel IDs are still parsed
-    from session metadata, but human-friendly names may remain blank.
-    """
+def load_channel_mapping(path):
+    """Load an optional channel-id mapping without making it a requirement."""
     global CHANNEL_MAPPING, CHANNEL_ID_TO_NAME
     CHANNEL_MAPPING = {"channels": {}}
     CHANNEL_ID_TO_NAME = {}
@@ -48,8 +100,13 @@ def load_channel_mapping(path: Path | None):
         with open(path, "r", encoding="utf-8") as f:
             CHANNEL_MAPPING = json.load(f)
         CHANNEL_ID_TO_NAME = {
-            cid: (f"#{data.get('name')}" if data.get("name") and not str(data.get("name")).startswith('#') else str(data.get("name") or f"#{cid}"))
+            str(cid): (
+                str(data.get("name"))
+                if str(data.get("name") or "").startswith("#")
+                else f"#{data.get('name')}"
+            )
             for cid, data in CHANNEL_MAPPING.get("channels", {}).items()
+            if data.get("name")
         }
     except FileNotFoundError:
         print(f"WARNING: Channel mapping file not found: {path}")
@@ -57,24 +114,37 @@ def load_channel_mapping(path: Path | None):
         print(f"WARNING: Failed to load channel mapping {path}: {exc}")
 
 
-def make_source_config(name: str, root: Path):
-    return {
-        "name": name,
-        "root": root.expanduser().resolve(),
-    }
+def discover_openclaw_session_sources():
+    """Return every agent JSONL sessions directory, keeping main compatible."""
+    sources = []
+    seen = set()
 
+    def add(key, directory):
+        directory = Path(directory).expanduser().resolve()
+        if directory in seen:
+            return
+        seen.add(directory)
+        sources.append({"key": key, "label": f"OpenClaw {key}", "dir": directory})
 
-def get_log_sources():
-    return [
-        make_source_config("openclaw", SESSIONS_DIR),
-        make_source_config("codex_cli", CODEX_SESSIONS_DIR),
-    ]
+    add("main", SESSIONS_DIR)
+    if OPENCLAW_AGENTS_DIR.exists():
+        for agent_dir in sorted(OPENCLAW_AGENTS_DIR.iterdir()):
+            if agent_dir.is_dir():
+                add(agent_dir.name, agent_dir / "sessions")
+    return sources
 
 # Model reference initial data
 MODEL_REFERENCE_DATA = [
-    ("openai-codex/gpt-5.2", "codex", "OpenAI", "gpt-5.2", 1.0),
-    ("openai-codex/gpt-5.2-codex", "codex", "OpenAI", "gpt-5.2-c", 1.0),
-    ("openai-codex/gpt-5.3-codex", "codex", "OpenAI", "gpt-5.3-c", 1.0),
+    ("openai/gpt-5.2", "openai", "OpenAI", "gpt-5.2", 1.0),
+    ("openai/gpt-5.2-codex", "openai", "OpenAI", "gpt-5.2-c", 1.0),
+    ("openai/gpt-5.3-codex", "openai", "OpenAI", "gpt-5.3-c", 1.0),
+    ("openai/gpt-5.4", "openai", "OpenAI", "gpt-5.4", 1.0),
+    ("openai/gpt-5.4-codex", "openai", "OpenAI", "gpt-5.4-codex", 1.0),
+    ("openai/gpt-5.4-mini", "openai", "OpenAI", "gpt-5.4-mini", 1.0),
+    ("openai/gpt-5.5", "openai", "OpenAI", "gpt-5.5", 1.0),
+    ("openai-codex/gpt-5.2", "openai-codex", "OpenAI", "gpt-5.2", 1.0),
+    ("openai-codex/gpt-5.2-codex", "openai-codex", "OpenAI", "gpt-5.2-c", 1.0),
+    ("openai-codex/gpt-5.3-codex", "openai-codex", "OpenAI", "gpt-5.3-c", 1.0),
 
     # GitHub Copilot PRU weighting (0 = free)
     ("github-copilot/gpt-5-mini", "gh-copilot", "OpenAI", "gpt-5-mini", 0.0),
@@ -93,6 +163,10 @@ MODEL_REFERENCE_DATA = [
     ("anthropic/claude-opus-4-5", "anthropic", "Anthropic", "opus-4.5", 1.0),
     ("anthropic/claude-sonnet-4-6", "anthropic", "Anthropic", "sonnet-4.6", 1.0),
     ("anthropic/claude-sonnet-4-5", "anthropic", "Anthropic", "sonnet-4.5", 1.0),
+    ("claude/claude-opus-4-6", "claude", "Anthropic", "opus-4.6", 1.0),
+    ("claude/claude-opus-4-5", "claude", "Anthropic", "opus-4.5", 1.0),
+    ("claude/claude-sonnet-4-6", "claude", "Anthropic", "sonnet-4.6", 1.0),
+    ("claude/claude-sonnet-4-5", "claude", "Anthropic", "sonnet-4.5", 1.0),
 
     ("modal/zai-org/GLM-5-FP8", "modal", "Z.AI", "glm-5", 1.0),
     ("zai/glm-5", "zai", "Z.AI", "glm-5", 1.0),
@@ -101,6 +175,7 @@ MODEL_REFERENCE_DATA = [
 
     ("moonshot/kimi-k2.5", "moonshot", "Moonshot", "kimi-k2.5", 1.0),
     ("kimi-coding/k2p5", "kimi-code", "Moonshot", "k2p5", 1.0),
+    ("kimi-code/k3-256k", "kimi-code", "Moonshot", "k3-256k", 1.0),
 
     ("abacus/claude-opus-4-6", "abacus", "Anthropic", "opus-4.6", 1.0),
     ("abacus/claude-opus-4-5-20251101", "abacus", "Anthropic", "opus-4.5", 1.0),
@@ -127,6 +202,268 @@ PROVIDER_COST_DATA = [
     ("modal", "2026-02-04", "free_trial", 0, None, "Free trial, limited quota"),
 ]
 
+PAYG_RATECARD_PATH = SCRIPT_DIR / "ref" / "payg_model_rates.tsv"
+_PAYG_RATECARD_CACHE = None
+
+# Pioneer input handling.
+#
+# HISTORY: Pioneer's anthropic-compatible streaming reports input_tokens as a
+# grossly-inflated gross-prompt count (e.g. ~49k) while real billable
+# non-cached input is ~1200/message. We previously OVERRODE input to a flat
+# 1200 at INGEST time (destructive: raw was lost).
+#
+# CHANGE 2026-06-11: store RAW Pioneer session-log data in the DB so we
+# can see whether Pioneer ever fixes their API. The 1200 estimate now lives in
+# the VIEWER as a per-model toggle (override applied locally, not persisted).
+# These constants are kept so the viewer/ratecard layer can reference the
+# canonical estimate value. The ingest-time override is OFF by default.
+PIONEER_INPUT_ESTIMATE_START_DATE = "2026-06-05"
+PIONEER_ESTIMATED_INPUT_TOKENS = 1200
+PIONEER_INPUT_ESTIMATE_SOURCE = "pioneer_input_estimate_1200"
+# Master switch: when False, raw Pioneer input/cost is stored unchanged and the
+# viewer toggle owns the 1200 override. Do NOT re-enable without removing the
+# viewer-side toggle, or the two overrides will compound.
+PIONEER_INGEST_OVERRIDE_ENABLED = False
+
+
+def is_pioneer_estimate_model(model_raw: str) -> bool:
+    """True for pioneer/ opus|sonnet|haiku refs that get the flat input estimate.
+
+    Scope is intentionally narrow: only the `pioneer/` provider (NOT
+    `pioneer-ai/`), and only Claude opus/sonnet/haiku model families.
+    """
+    if not model_raw.startswith("pioneer/"):
+        return False
+    tail = model_raw.split("/", 1)[1].lower()
+    return any(fam in tail for fam in ("opus", "sonnet", "haiku"))
+
+
+def _to_float(value, default=0.0):
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def load_payg_ratecard():
+    """Load owned PAYG-equivalent token rates from ref/payg_model_rates.tsv."""
+    global _PAYG_RATECARD_CACHE
+    if _PAYG_RATECARD_CACHE is not None:
+        return _PAYG_RATECARD_CACHE
+
+    rates = {}
+    if PAYG_RATECARD_PATH.exists():
+        with open(PAYG_RATECARD_PATH, "r", encoding="utf-8") as f:
+            header = None
+            for raw_line in f:
+                line = raw_line.rstrip("\n")
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("\t")
+                if header is None:
+                    header = parts
+                    continue
+                row = dict(zip(header, parts))
+                model_raw = (row.get("model_raw") or "").strip()
+                if not model_raw:
+                    continue
+                rates[model_raw] = {
+                    "input": _to_float(row.get("input_per_mtok")),
+                    "output": _to_float(row.get("output_per_mtok")),
+                    "cache_read": _to_float(row.get("cache_read_per_mtok")),
+                    "cache_write": _to_float(row.get("cache_write_per_mtok")),
+                }
+    _PAYG_RATECARD_CACHE = rates
+    return rates
+
+
+def calculate_payg_equivalent_cost(model_raw: str, usage: dict):
+    """Return token PAYG-equivalent cost for CLI rows, or None if no rate exists.
+
+    This is intentionally separate from the dashboard's subscription/pro-rata
+    EST COST fields. It fills the normal cost columns used for token-rate
+    normalized usage totals. Existing non-zero provider/OpenClaw costs win.
+    """
+    rates = load_payg_ratecard()
+    rate = rates.get(model_raw)
+    if not rate and model_raw.startswith(("codex/", "openai-codex/")):
+        _, model_name = model_raw.split("/", 1)
+        rate = rates.get(f"openai/{model_name}") or rates.get(f"codex_cli/{model_name}")
+    if not rate and model_raw.startswith("pioneer-ai/"):
+        # Legacy alias: pioneer-ai/<model> uses the same Pioneer ratecard entry
+        # as pioneer/<model> (Pioneer is ~10% above Anthropic base on
+        # input/output/cacheRead, so do NOT fall back to claude/<model>).
+        _, model_name = model_raw.split("/", 1)
+        rate = rates.get(f"pioneer/{model_name}")
+    if not rate:
+        return None
+    cost = {
+        "input": (usage.get("input_tokens", 0) or 0) * rate["input"] / 1_000_000,
+        "output": (usage.get("output_tokens", 0) or 0) * rate["output"] / 1_000_000,
+        "cacheRead": (usage.get("cache_read", 0) or 0) * rate["cache_read"] / 1_000_000,
+        "cacheWrite": (usage.get("cache_write", 0) or 0) * rate["cache_write"] / 1_000_000,
+    }
+    cost["total"] = cost["input"] + cost["output"] + cost["cacheRead"] + cost["cacheWrite"]
+    return cost
+
+
+def maybe_calculate_cli_cost(model_raw: str, usage: dict, cost=None):
+    """Use source/provider cost if non-zero; otherwise calculate CLI PAYG-equivalent cost."""
+    cost = cost or {}
+    if any((cost.get(k) or 0) for k in ("input", "output", "cacheRead", "cacheWrite", "total")):
+        return cost
+    if model_raw.startswith(("codex_cli/", "claude/", "openai/", "openai-codex/", "codex/", "pioneer/", "pioneer-ai/", "kimi-code/")):
+        calculated = calculate_payg_equivalent_cost(model_raw, usage)
+        if calculated is not None:
+            return calculated
+    return cost
+
+
+def apply_pioneer_input_estimate(model_raw: str, timestamp: str | None, usage: dict, cost=None):
+    """Override Pioneer streaming input tokens with a flat estimate.
+
+    Pioneer's streamed usage reports input tokens unreliably (zero, or grossly
+    inflated gross-prompt). For the `pioneer/`
+    opus|sonnet|haiku rows we replace input with a flat ~1200/message estimate
+    (derived from a day of Pioneer web usage) on EVERY matching line from
+    2026-06-05 onward. pioneer-ai/ and other providers are not touched.
+    """
+    if not PIONEER_INGEST_OVERRIDE_ENABLED:
+        # Override now lives in the viewer (per-model toggle). Store raw.
+        return usage, cost or {}, None, None, 0
+    if not is_pioneer_estimate_model(model_raw):
+        return usage, cost or {}, None, None, 0
+    if not timestamp or str(timestamp)[:10] < PIONEER_INPUT_ESTIMATE_START_DATE:
+        return usage, cost or {}, None, None, 0
+
+    adjusted = dict(usage)
+    adjusted["input_tokens"] = PIONEER_ESTIMATED_INPUT_TOKENS
+    adjusted["total_tokens"] = (
+        (adjusted.get("input_tokens", 0) or 0)
+        + (adjusted.get("output_tokens", 0) or 0)
+        + (adjusted.get("cache_read", 0) or 0)
+        + (adjusted.get("cache_write", 0) or 0)
+    )
+    calculated = calculate_payg_equivalent_cost(model_raw, adjusted) or cost or {}
+    return adjusted, calculated, PIONEER_INPUT_ESTIMATE_SOURCE, "payg_estimated_input", 1
+
+
+def ensure_cost_metadata_columns(conn):
+    """Add optional cost and ingestion provenance columns."""
+    for table in ("messages", "segments"):
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if "cost_source" not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN cost_source TEXT")
+        if "cost_kind" not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN cost_kind TEXT")
+        if "cost_is_estimated" not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN cost_is_estimated INTEGER DEFAULT 0")
+    message_columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
+    if "ingest_source" not in message_columns:
+        conn.execute("ALTER TABLE messages ADD COLUMN ingest_source TEXT")
+    if "duplicate_of" not in message_columns:
+        conn.execute("ALTER TABLE messages ADD COLUMN duplicate_of TEXT")
+    if "excluded_reason" not in message_columns:
+        conn.execute("ALTER TABLE messages ADD COLUMN excluded_reason TEXT")
+    if "is_excluded" not in message_columns:
+        conn.execute(
+            "ALTER TABLE messages ADD COLUMN is_excluded INTEGER NOT NULL DEFAULT 0"
+        )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_messages_ingest_source ON messages(ingest_source)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_messages_excluded ON messages(is_excluded)"
+    )
+    conn.commit()
+
+
+def backfill_cli_payg_costs(conn, session_ids=None):
+    """Backfill zero-cost CLI-style messages from token usage + owned ratecard.
+
+    If session_ids is provided (incremental refresh), only those sessions are
+    scanned. A full pass (session_ids=None) scans the whole DB. Scoping avoids
+    re-fetching ~10k permanently-zero rows on every 5-minute refresh.
+    """
+    ensure_cost_metadata_columns(conn)
+    cur = conn.cursor()
+    scope_ids = None
+    if session_ids is not None:
+        scope_ids = [s for s in session_ids if s]
+        if not scope_ids:
+            return 0  # nothing changed this run
+    base_sql = """SELECT m.id, m.session_id, mr.model_raw, m.input_tokens, m.output_tokens,
+                  m.cache_read, m.cache_write, m.total_tokens,
+                  m.cost_input, m.cost_output, m.cost_cache_read, m.cost_cache_write, m.cost_total
+           FROM messages m
+           JOIN model_reference mr ON mr.id = m.model_ref_id
+           WHERE (mr.model_raw LIKE 'codex_cli/%' OR mr.model_raw LIKE 'claude/%'
+                  OR mr.model_raw LIKE 'openai/%' OR mr.model_raw LIKE 'openai-codex/%'
+                  OR mr.model_raw LIKE 'codex/%'
+                  OR mr.model_raw LIKE 'pioneer/%' OR mr.model_raw LIKE 'pioneer-ai/%'
+                  OR mr.model_raw LIKE 'kimi-code/%')
+             AND COALESCE(m.cost_total, 0) = 0"""
+    if scope_ids is not None:
+        placeholders = ",".join("?" * len(scope_ids))
+        rows = cur.execute(base_sql + f" AND m.session_id IN ({placeholders})", scope_ids).fetchall()
+    else:
+        rows = cur.execute(base_sql).fetchall()
+    updated = 0
+    touched_sessions = set()
+    missing_rates = set()
+    for row in rows:
+        msg_id, session_id, model_raw = row[0], row[1], row[2]
+        usage = {
+            "input_tokens": row[3] or 0,
+            "output_tokens": row[4] or 0,
+            "cache_read": row[5] or 0,
+            "cache_write": row[6] or 0,
+            "total_tokens": row[7] or 0,
+        }
+        cost = calculate_payg_equivalent_cost(model_raw, usage)
+        if cost is None:
+            missing_rates.add(model_raw)
+            continue
+        if not cost.get("total"):
+            continue
+        cur.execute(
+            """UPDATE messages
+               SET cost_input = ?, cost_output = ?, cost_cache_read = ?, cost_cache_write = ?, cost_total = ?,
+                   cost_source = 'ratecard', cost_kind = 'payg_equivalent', cost_is_estimated = 0
+               WHERE id = ? AND COALESCE(cost_total, 0) = 0""",
+            (cost["input"], cost["output"], cost["cacheRead"], cost["cacheWrite"], cost["total"], msg_id),
+        )
+        if cur.rowcount:
+            updated += 1
+            if session_id:
+                touched_sessions.add(session_id)
+
+    for session_id in touched_sessions:
+        recompute_segments(conn, session_id)
+    seg_sql = """UPDATE segments
+           SET cost_source = 'ratecard', cost_kind = 'payg_equivalent', cost_is_estimated = 0
+           WHERE session_id IN (SELECT DISTINCT m.session_id
+                                FROM messages m JOIN model_reference mr ON mr.id = m.model_ref_id
+                                WHERE mr.model_raw LIKE 'codex_cli/%' OR mr.model_raw LIKE 'claude/%'
+                                   OR mr.model_raw LIKE 'openai/%' OR mr.model_raw LIKE 'openai-codex/%'
+                                   OR mr.model_raw LIKE 'codex/%'
+                                   OR mr.model_raw LIKE 'pioneer/%' OR mr.model_raw LIKE 'pioneer-ai/%'
+                                   OR mr.model_raw LIKE 'kimi-code/%')
+             AND COALESCE(cost_total, 0) > 0
+             AND cost_source IS NULL"""
+    if scope_ids is not None:
+        placeholders = ",".join("?" * len(scope_ids))
+        cur.execute(seg_sql + f" AND session_id IN ({placeholders})", scope_ids)
+    else:
+        cur.execute(seg_sql)
+    conn.commit()
+    if missing_rates:
+        print(f"  PAYG ratecard missing for: {', '.join(sorted(missing_rates))}")
+    print(f"✓ Backfilled CLI PAYG-equivalent costs for {updated} messages across {len(touched_sessions)} sessions")
+    return updated
+
 
 def init_db(conn):
     """Initialize database schema.
@@ -144,6 +481,7 @@ def init_db(conn):
         if "no such column: model_ref_id" not in str(e):
             raise
     conn.commit()
+    ensure_cost_metadata_columns(conn)
     print("✓ Schema created")
 
 
@@ -231,6 +569,53 @@ def maybe_backup_db(db_path: Path, max_age_hours: int = 24, keep: int = 14):
 
 # --- Model reference helpers ---
 
+def canonical_model_display_name(model_raw: str) -> str:
+    """Return the compact, provider-free model label used by the dashboard.
+
+    `model_raw` remains untouched as the accounting/provenance key. This alias
+    is deliberately presentation-only so routes such as Anthropic, Pioneer,
+    Nonstop and Claude CLI can group under the same human-readable model.
+    """
+    if not model_raw:
+        return "unknown"
+    model = model_raw.split("/", 1)[1] if "/" in model_raw else model_raw
+
+    # Aggregators often embed vendor/account/router paths in the identifier.
+    # The endpoint column already preserves that route; the model label only
+    # needs the terminal product name.
+    model = model.rsplit("/", 1)[-1]
+
+    label = model.strip()
+    lower = label.lower()
+
+    # Claude route names carry a redundant vendor prefix.
+    if lower.startswith("claude-"):
+        lower = lower[len("claude-"):]
+    lower = re.sub(
+        r"^(opus|sonnet|haiku|fable)-(\d+)-(\d+)(.*)$",
+        r"\1-\2.\3\4",
+        lower,
+    )
+
+    # Kimi product/transport suffixes are not useful grouping dimensions.
+    if lower.startswith("kimi-for-coding"):
+        return lower
+    kimi_name = lower.removeprefix("kimi-")
+    if re.search(r"(?:^|-)k?2(?:p|[.-])?5(?:-|$)", kimi_name) or kimi_name == "k2p5":
+        return "k2.5"
+    if re.search(r"(?:^|-)k?2(?:p|[.-])?6(?:-|$)", kimi_name) or kimi_name == "k2p6":
+        return "k2.6"
+    if re.search(r"(?:^|-)k?2(?:p|[.-])?7(?:-|$)", kimi_name) or kimi_name == "k2p7":
+        return "k2.7"
+    if re.search(r"(?:^|-)k?3(?:-|$)", kimi_name):
+        return "k3"
+    if kimi_name.startswith("k2"):
+        return "k2"
+
+    # Normalise casing and vendor path residue for the remaining families.
+    return lower
+
+
 def infer_model_reference(model_raw: str):
     """Infer model_reference fields for unknown models.
 
@@ -250,7 +635,11 @@ def infer_model_reference(model_raw: str):
     author = "Unknown"
 
     if provider == "openai-codex":
+        endpoint, author = "openai-codex", "OpenAI"
+    elif provider == "codex":
         endpoint, author = "codex", "OpenAI"
+    elif provider == "openai":
+        endpoint, author = "openai", "OpenAI"
     elif provider == "github-copilot":
         endpoint = "gh-copilot"
         ml = model.lower()
@@ -264,14 +653,33 @@ def infer_model_reference(model_raw: str):
             author = "xAI"
     elif provider == "anthropic":
         endpoint, author = "anthropic", "Anthropic"
-    elif provider in ("kimi-coding", "moonshot"):
-        endpoint, author = ("kimi-code" if provider == "kimi-coding" else "moonshot"), "Moonshot"
-    elif provider == "bailian":
+    elif provider == "claude":
+        endpoint, author = "claude", "Anthropic"
+    elif provider in ("kimi-coding", "kimi-code", "kimi", "moonshot"):
+        endpoint, author = ("moonshot" if provider == "moonshot" else "kimi-code"), "Moonshot"
+    elif provider in ("bailian", "bailian-token-plan"):
         endpoint, author = "bailian", "Alibaba"
     elif provider in ("zai", "modal"):
         endpoint, author = provider, "Z.AI"
     elif provider in ("opencode", "ollama-cloud"):
         endpoint, author = "opencode", "Z.AI"
+    elif provider == "opencode-go":
+        endpoint = "opencode"
+        ml = model.lower()
+        if "kimi" in ml:
+            author = "Moonshot"
+        elif "qwen" in ml:
+            author = "Alibaba"
+        elif "glm" in ml:
+            author = "Z.AI"
+    elif provider == "fireworks-ai":
+        endpoint = "fireworks-ai"
+        model = model.rsplit("/", 1)[-1]
+        ml = model.lower()
+        if ml.startswith("kimi-"):
+            author = "Moonshot"
+        elif ml.startswith("glm-"):
+            author = "Z.AI"
     elif provider == "abacus":
         endpoint = "abacus"
         author = "Anthropic" if "claude" in model.lower() else "Unknown"
@@ -291,7 +699,55 @@ def infer_model_reference(model_raw: str):
         elif ml.endswith("-mini") or ml == "gpt-4.1":
             pru_multiplier = 0.0
 
-    return (endpoint, author, model, pru_multiplier)
+    if provider == "codex_cli":
+        endpoint = "openai-codex"
+    return (
+        endpoint,
+        author,
+        canonical_model_display_name(model_raw),
+        pru_multiplier,
+    )
+
+
+# Safe endpoint normalisation: aliases that are ALWAYS collapsed because the
+# left-hand value is never an intentional billing split (it is a leftover
+# provider/transport spelling). Intentional groupings (pioneer vs pioneer-ai,
+# moonshot vs kimi-code, openai vs openai-codex, the anthropic/claude family,
+# deepseek routes) are NOT listed here — those wait for an explicit decision.
+MODEL_ENDPOINT_ALIASES = {
+    "codex_cli": "openai-codex",
+    "kimi": "kimi-code",
+    "kimi-coding": "kimi-code",
+    "ollama": "opencode",
+    "ollama-cloud": "opencode",
+    "opencode-go": "opencode",
+    "bailian-token-plan": "bailian",
+    "deepseek-direct": "deepseek",
+}
+
+
+def normalize_model_reference_aliases(conn):
+    """Apply the canonical display policy to existing and newly-seen models."""
+    cur = conn.cursor()
+    rows = cur.execute(
+        "SELECT id, model_raw, endpoint FROM model_reference"
+    ).fetchall()
+    updated = 0
+    for model_id, model_raw, endpoint in rows:
+        display = canonical_model_display_name(model_raw)
+        canonical_endpoint = "openai-codex" if model_raw.startswith("codex_cli/") else endpoint
+        canonical_endpoint = MODEL_ENDPOINT_ALIASES.get(canonical_endpoint, canonical_endpoint)
+        cur.execute(
+            """
+            UPDATE model_reference
+            SET model = ?, endpoint = ?
+            WHERE id = ? AND (model != ? OR endpoint != ?)
+            """,
+            (display, canonical_endpoint, model_id, display, canonical_endpoint),
+        )
+        updated += cur.rowcount
+    conn.commit()
+    return updated
 
 
 def ensure_model_reference(cur, model_raw: str):
@@ -302,6 +758,18 @@ def ensure_model_reference(cur, model_raw: str):
     cur.execute(
         "INSERT OR IGNORE INTO model_reference (model_raw, endpoint, author, model, pru_multiplier) VALUES (?, ?, ?, ?, ?)",
         (model_raw, endpoint, author, model, pru_multiplier),
+    )
+    cur.execute(
+        """
+        UPDATE model_reference
+        SET endpoint = ?, author = ?, model = ?, pru_multiplier = ?
+        WHERE model_raw = ?
+          AND (
+              COALESCE(author, '') IN ('', 'Unknown')
+              OR endpoint IN ('kimi', 'bailian-token-plan', 'opencode-go')
+          )
+        """,
+        (endpoint, author, model, pru_multiplier, model_raw),
     )
 
 
@@ -498,31 +966,153 @@ def update_ingest_state(cur, filename: str, session_id: str, last_offset: int, s
     )
 
 
-def make_file_locator(source, filepath: Path) -> str:
-    if source["name"] == "openclaw":
-        return os.path.basename(filepath)
-    rel = filepath.resolve().relative_to(source["root"])
-    return f'{source["name"]}:{rel.as_posix()}'
-
-
-def list_source_files(source):
-    root = source["root"]
-    if not root.exists():
-        return [], f'{source["name"]}: directory missing ({root})'
-    if source["name"] == "openclaw":
-        active = sorted(root.glob("*.jsonl"))
-        deleted = sorted(root.glob("*.jsonl.deleted.*"))
-        reset = sorted(root.glob("*.jsonl.reset.*"))
-        all_files = active + deleted + reset
-        summary = f'{source["name"]}: {len(active)} active + {len(deleted)} deleted + {len(reset)} reset = {len(all_files)} total'
-        return all_files, summary
-    files = sorted(root.rglob("*.jsonl"))
-    return files, f'{source["name"]}: {len(files)} total'
-
-
 def extract_codex_session_id_from_path(filepath: Path):
     match = re.search(r'([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})', filepath.name)
     return match.group(1) if match else None
+
+
+def extract_codex_thread_id_from_idempotency_key(value):
+    if not isinstance(value, str):
+        return None
+    match = CODEX_APP_SERVER_IDEMPOTENCY_RE.match(value)
+    return match.group("thread_id") if match else None
+
+
+def extract_codex_session_id_from_meta(data):
+    """Codex CLI stores its durable session/thread id in session_meta.payload.id."""
+    if data.get("type") != "session_meta":
+        return None
+    payload = data.get("payload") if isinstance(data.get("payload"), dict) else {}
+    value = payload.get("id")
+    return value if isinstance(value, str) and value else None
+
+
+def extract_codex_session_id_from_file(filepath: Path):
+    """Read just enough of a Codex JSONL file to get its explicit session id."""
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    data = json.loads(line)
+                except Exception:
+                    continue
+                session_id = extract_codex_session_id_from_meta(data)
+                if session_id:
+                    return session_id
+    except Exception:
+        pass
+    return extract_codex_session_id_from_path(filepath)
+
+
+def collect_openclaw_codex_thread_ids(force_refresh=False):
+    """Explicit Codex thread/session ids already represented in OpenClaw logs.
+
+    OpenClaw's codex-app-server bridge writes the Codex thread id in several
+    places:
+    - normal session messages: message.idempotencyKey =
+      codex-app-server:<threadId>:<turnId>:<role>:<n>
+    - trajectory sidecars: data.threadId / data.turnId
+    - app-server sidecar JSON: threadId
+
+    If ~/.codex session_meta.payload.id matches one of these thread ids, the
+    Codex CLI JSONL is the same run already represented by OpenClaw messages.
+    """
+    global _OPENCLAW_CODEX_THREAD_IDS_CACHE
+    if _OPENCLAW_CODEX_THREAD_IDS_CACHE is not None and not force_refresh:
+        return set(_OPENCLAW_CODEX_THREAD_IDS_CACHE)
+
+    roots = [source["dir"] for source in OPENCLAW_SESSION_SOURCES]
+
+    def add_thread_id(dest, value):
+        if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", value):
+            dest.add(value)
+
+    def scan_json_obj(dest, obj):
+        if not isinstance(obj, dict):
+            return
+        msg = obj.get("message") if isinstance(obj.get("message"), dict) else {}
+        add_thread_id(dest, extract_codex_thread_id_from_idempotency_key(msg.get("idempotencyKey")))
+        data = obj.get("data") if isinstance(obj.get("data"), dict) else {}
+        add_thread_id(dest, data.get("threadId"))
+        add_thread_id(dest, obj.get("threadId"))
+
+    def scan_file(filepath):
+        """Return the set of thread ids found in one file."""
+        found = set()
+        try:
+            if filepath.name.endswith(".codex-app-server.json"):
+                with open(filepath, "r", encoding="utf-8") as f:
+                    scan_json_obj(found, json.load(f))
+                return found
+            with open(filepath, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        scan_json_obj(found, json.loads(line))
+                    except Exception:
+                        continue
+        except Exception:
+            return found
+        return found
+
+    # Load persistent per-file cache: { path: [mtime, size, [thread_ids...]] }.
+    # Only changed files (by mtime+size) are re-parsed; the rest reuse cached
+    # results. Turns a ~40s cold full re-scan into a sub-second refresh.
+    disk_cache = {}
+    if not force_refresh:
+        try:
+            with open(CODEX_THREAD_ID_CACHE_PATH, "r", encoding="utf-8") as f:
+                disk_cache = json.load(f)
+            if not isinstance(disk_cache, dict):
+                disk_cache = {}
+        except Exception:
+            disk_cache = {}
+
+    thread_ids = set()
+    new_cache = {}
+    for root in roots:
+        if not root.exists():
+            continue
+        candidates = []
+        candidates.extend(root.glob("*.jsonl"))
+        candidates.extend(root.glob("*.jsonl.deleted.*"))
+        candidates.extend(root.glob("*.jsonl.reset.*"))
+        candidates.extend(root.glob("*.trajectory.jsonl"))
+        candidates.extend(root.glob("*.jsonl.codex-app-server.json"))
+        for filepath in candidates:
+            key = str(filepath)
+            try:
+                st = filepath.stat()
+            except Exception:
+                continue
+            cached = disk_cache.get(key)
+            if (
+                isinstance(cached, list)
+                and len(cached) == 3
+                and cached[0] == st.st_mtime
+                and cached[1] == st.st_size
+            ):
+                found = set(cached[2])
+            else:
+                found = scan_file(filepath)
+            new_cache[key] = [st.st_mtime, st.st_size, sorted(found)]
+            thread_ids |= found
+
+    # Persist refreshed cache (best-effort, atomic replace).
+    try:
+        tmp_path = CODEX_THREAD_ID_CACHE_PATH.with_suffix(".tmp")
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(new_cache, f)
+        os.replace(tmp_path, CODEX_THREAD_ID_CACHE_PATH)
+    except Exception:
+        pass
+
+    _OPENCLAW_CODEX_THREAD_IDS_CACHE = set(thread_ids)
+    return thread_ids
+
+
+def is_codex_session_mirrored_by_openclaw(filepath: Path):
+    session_id = extract_codex_session_id_from_file(filepath)
+    return bool(session_id and session_id in collect_openclaw_codex_thread_ids())
 
 
 def extract_codex_model(data):
@@ -538,6 +1128,73 @@ def extract_codex_model(data):
             if isinstance(model, str) and model:
                 return model
     return None
+
+
+def normalize_codex_source_label(value):
+    """Return a short string label for Codex CLI session metadata."""
+    if isinstance(value, str) and value:
+        return value
+    if isinstance(value, dict):
+        subagent = value.get("subagent")
+        if isinstance(subagent, dict):
+            spawn = subagent.get("thread_spawn")
+            if isinstance(spawn, dict):
+                nickname = spawn.get("agent_nickname")
+                role = spawn.get("agent_role")
+                if nickname and role:
+                    return f"{nickname}:{role}"
+                if nickname:
+                    return str(nickname)
+        return "codex_cli"
+    return "codex_cli"
+
+
+def normalize_codex_usage(last_usage):
+    """Map Codex CLI usage into the tracker schema without double-counting cached input."""
+    gross_input_tokens = int(last_usage.get("input_tokens") or 0)
+    cached_input_tokens = int(last_usage.get("cached_input_tokens") or 0)
+    output_tokens = int(last_usage.get("output_tokens") or 0)
+    total_tokens = int(last_usage.get("total_tokens") or 0)
+    return {
+        "input_tokens": max(gross_input_tokens - cached_input_tokens, 0),
+        "output_tokens": output_tokens,
+        "cache_read": cached_input_tokens,
+        "cache_write": 0,
+        "total_tokens": total_tokens,
+    }
+
+
+def _canonical_usage_state(value):
+    if not isinstance(value, dict):
+        return None
+    def canonicalize(item):
+        if isinstance(item, dict):
+            return tuple((key, canonicalize(item.get(key))) for key in sorted(item))
+        if isinstance(item, list):
+            return tuple(canonicalize(part) for part in item)
+        if item is None:
+            return 0
+        return item
+
+    return canonicalize(value)
+
+
+def codex_token_count_dedupe_key(info):
+    """Semantic identity for Codex CLI token_count events.
+
+    Codex can emit the same token_count payload more than once with different
+    transport metadata, including rate-limit ids. The usage state is the thing
+    being measured, so dedupe on running totals plus the last usage delta only.
+    """
+    if not isinstance(info, dict):
+        return None
+    last_usage = info.get("last_token_usage")
+    if not isinstance(last_usage, dict):
+        return None
+    return (
+        _canonical_usage_state(info.get("total_token_usage")),
+        _canonical_usage_state(last_usage),
+    )
 
 
 def get_last_model_for_session(cur, session_id: str):
@@ -557,15 +1214,40 @@ def get_last_model_for_session(cur, session_id: str):
     return row[0].split("/", 1)[1]
 
 
-def insert_message_row(cur, msg_id, session_id, parent_id, timestamp, model_raw, usage, cost=None):
+def insert_message_row(
+    cur,
+    msg_id,
+    session_id,
+    parent_id,
+    timestamp,
+    model_raw,
+    usage,
+    cost=None,
+    ingest_source=None,
+):
     model_ref_id = get_model_ref_id(cur, model_raw)
-    cost = cost or {}
+    source_cost = cost or {}
+    usage, source_cost, estimate_source, estimate_kind, is_estimated = apply_pioneer_input_estimate(
+        model_raw, timestamp, usage, source_cost
+    )
+    had_source_cost = any((source_cost.get(k) or 0) for k in ("input", "output", "cacheRead", "cacheWrite", "total"))
+    cost = maybe_calculate_cli_cost(model_raw, usage, source_cost)
+    calculated_cost = (not had_source_cost) and model_raw.startswith(("codex_cli/", "claude/", "openai/", "kimi-code/")) and bool(cost.get("total"))
+    cost_source = estimate_source
+    cost_kind = estimate_kind
+    cost_is_estimated = is_estimated
+    if not cost_source and calculated_cost:
+        cost_source = "ratecard"
+        cost_kind = "payg_equivalent"
+        cost_is_estimated = 0
     cur.execute(
         """INSERT OR REPLACE INTO messages
            (id, session_id, parent_id, timestamp, model_ref_id,
             input_tokens, output_tokens, cache_read, cache_write, total_tokens,
-            cost_input, cost_output, cost_cache_read, cost_cache_write, cost_total)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            cost_input, cost_output, cost_cache_read, cost_cache_write, cost_total,
+            cost_source, cost_kind, cost_is_estimated, ingest_source,
+            duplicate_of, excluded_reason, is_excluded)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0)""",
         (
             msg_id,
             session_id,
@@ -582,11 +1264,17 @@ def insert_message_row(cur, msg_id, session_id, parent_id, timestamp, model_raw,
             cost.get("cacheRead", 0),
             cost.get("cacheWrite", 0),
             cost.get("total", 0),
+            cost_source,
+            cost_kind,
+            cost_is_estimated,
+            ingest_source,
         ),
     )
 
 
-def ingest_openclaw_messages_from_offset(filepath: Path, conn, start_offset: int, session_id: str):
+def ingest_openclaw_messages_from_offset(
+    filepath: Path, conn, start_offset: int, session_id: str, source_key: str
+):
     """Append-only ingest: read only new bytes and upsert assistant messages.
 
     Does NOT delete existing messages — DB is the archive.
@@ -638,6 +1326,7 @@ def ingest_openclaw_messages_from_offset(filepath: Path, conn, start_offset: int
                         "cacheWrite": cost.get("cacheWrite", 0) if cost else 0,
                         "total": cost.get("total", 0) if cost else 0,
                     },
+                    ingest_source=f"openclaw_jsonl:{source_key}",
                 )
                 processed += 1
 
@@ -646,9 +1335,13 @@ def ingest_openclaw_messages_from_offset(filepath: Path, conn, start_offset: int
 
 def ingest_codex_messages_from_offset(filepath: Path, conn, start_offset: int, session_id: str):
     """Append-only ingest for Codex CLI token-count events."""
+    if is_codex_session_mirrored_by_openclaw(filepath):
+        return 0
+
     cur = conn.cursor()
     processed = 0
     current_model = get_last_model_for_session(cur, session_id)
+    seen_token_count_states = set()
 
     with open(filepath, 'rb') as f:
         f.seek(start_offset)
@@ -671,10 +1364,15 @@ def ingest_codex_messages_from_offset(filepath: Path, conn, start_offset: int, s
             last_usage = info.get("last_token_usage")
             if not isinstance(last_usage, dict):
                 continue
+            dedupe_key = codex_token_count_dedupe_key(info)
+            if dedupe_key in seen_token_count_states:
+                continue
+            seen_token_count_states.add(dedupe_key)
 
             model_name = current_model or "unknown"
             model_raw = f"codex_cli/{model_name}"
             msg_id = f"{session_id}:codex:{line_offset}"
+            normalized_usage = normalize_codex_usage(last_usage)
             insert_message_row(
                 cur,
                 msg_id,
@@ -682,23 +1380,176 @@ def ingest_codex_messages_from_offset(filepath: Path, conn, start_offset: int, s
                 None,
                 data.get("timestamp"),
                 model_raw,
-                {
-                    "input_tokens": last_usage.get("input_tokens", 0),
-                    "output_tokens": last_usage.get("output_tokens", 0),
-                    "cache_read": last_usage.get("cached_input_tokens", 0),
-                    "cache_write": 0,
-                    "total_tokens": last_usage.get("total_tokens", 0),
-                },
+                normalized_usage,
+                ingest_source=(
+                    "codex_app_server"
+                    if codex_app_server_root_for(filepath)
+                    else "codex_cli"
+                ),
             )
             processed += 1
 
     return processed
 
 
-def ingest_messages_from_offset(filepath: Path, conn, start_offset: int, session_id: str, source):
-    if source["name"] == "codex_cli":
+def kimi_session_dir_for_wire(filepath: Path):
+    filepath = Path(filepath)
+    # ~/.kimi-code/sessions/<workspace>/session_<id>/agents/<agent>/wire.jsonl
+    try:
+        return filepath.parents[2]
+    except IndexError:
+        return filepath.parent
+
+
+def read_kimi_state(filepath: Path):
+    state_path = kimi_session_dir_for_wire(filepath) / "state.json"
+    try:
+        with open(state_path, "r", encoding="utf-8") as f:
+            state = json.load(f)
+            return state if isinstance(state, dict) else {}
+    except Exception:
+        return {}
+
+
+def extract_kimi_session_id_from_path(filepath: Path):
+    session_dir = kimi_session_dir_for_wire(filepath)
+    return session_dir.name or Path(filepath).stem
+
+
+def normalize_kimi_usage(value):
+    """Map Kimi Code wire usage into the tracker schema."""
+    if not isinstance(value, dict):
+        value = {}
+    input_tokens = int(value.get("inputOther") or value.get("input") or 0)
+    output_tokens = int(value.get("output") or 0)
+    cache_read = int(value.get("inputCacheRead") or 0)
+    cache_write = int(value.get("inputCacheCreation") or 0)
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_read": cache_read,
+        "cache_write": cache_write,
+        "total_tokens": input_tokens + output_tokens + cache_read + cache_write,
+    }
+
+
+def insert_kimi_session_stub(cur, filepath: Path, session_id: str, storage_name: str, created_at: str | None):
+    state = read_kimi_state(filepath)
+    work_dir = state.get("workDir")
+    if isinstance(work_dir, str) and work_dir:
+        label = f"kimi:{Path(work_dir).name}"
+    else:
+        label = "kimi-code"
+    session_nickname = session_id[9:13] if session_id and len(session_id) >= 13 else session_id
+    cur.execute(
+        """
+        INSERT OR REPLACE INTO sessions
+        (session_id, session_nickname, parent_nickname, filename, created_at,
+         channel_id, channel_name, channel_type, session_type, deleted_at)
+        VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?, NULL)
+        """,
+        (session_id, session_nickname, label, storage_name, created_at, "gui", "kimi_code"),
+    )
+
+
+def parse_kimi_session_file(filepath, conn):
+    """Parse a Kimi Code wire transcript and normalize usage.record rows."""
+    filepath = Path(filepath)
+    storage_name = get_session_storage_name(filepath, "kimi_code")
+    session_id = extract_kimi_session_id_from_path(filepath)
+    agent_id = filepath.parent.name or "main"
+    cur = conn.cursor()
+    state = read_kimi_state(filepath)
+    created_at = state.get("createdAt") if isinstance(state.get("createdAt"), str) else None
+    message_count = 0
+
+    try:
+        insert_kimi_session_stub(cur, filepath, session_id, storage_name, created_at)
+        with open(filepath, "r", encoding="utf-8") as f:
+            for line_num, line in enumerate(f, start=1):
+                try:
+                    data = json.loads(line)
+                except Exception:
+                    continue
+                if data.get("type") != "usage.record":
+                    continue
+                model_raw = data.get("model")
+                if not isinstance(model_raw, str) or not model_raw:
+                    model_raw = "kimi-code/unknown"
+                usage = normalize_kimi_usage(data.get("usage"))
+                timestamp = datetime.fromtimestamp((data.get("time") or 0) / 1000, tz=timezone.utc).isoformat() if data.get("time") else created_at
+                msg_id = f"{session_id}:kimi:{agent_id}:{line_num}"
+                insert_message_row(
+                    cur,
+                    msg_id,
+                    session_id,
+                    None,
+                    timestamp,
+                    model_raw,
+                    usage,
+                    ingest_source="kimi_cli",
+                )
+                message_count += 1
+        recompute_segments(conn, session_id)
+        return True, message_count, session_id
+    except Exception as e:
+        print(f"  Error reading {storage_name}: {e}")
+        return False, 0, None
+
+
+def ingest_kimi_messages_from_offset(filepath: Path, conn, start_offset: int, session_id: str):
+    """Append-only ingest for Kimi Code usage.record rows."""
+    cur = conn.cursor()
+    processed = 0
+    filepath = Path(filepath)
+    agent_id = filepath.parent.name or "main"
+    storage_name = get_session_storage_name(filepath, "kimi_code")
+    state = read_kimi_state(filepath)
+    created_at = state.get("createdAt") if isinstance(state.get("createdAt"), str) else None
+    insert_kimi_session_stub(cur, filepath, session_id, storage_name, created_at)
+
+    with open(filepath, "rb") as f:
+        f.seek(start_offset)
+        while True:
+            line_offset = f.tell()
+            line = f.readline()
+            if not line:
+                break
+            try:
+                data = json.loads(line.decode("utf-8", errors="strict"))
+            except Exception:
+                continue
+            if data.get("type") != "usage.record":
+                continue
+            model_raw = data.get("model")
+            if not isinstance(model_raw, str) or not model_raw:
+                model_raw = "kimi-code/unknown"
+            usage = normalize_kimi_usage(data.get("usage"))
+            timestamp = datetime.fromtimestamp((data.get("time") or 0) / 1000, tz=timezone.utc).isoformat() if data.get("time") else created_at
+            msg_id = f"{session_id}:kimi:{agent_id}:{line_offset}"
+            insert_message_row(
+                cur,
+                msg_id,
+                session_id,
+                None,
+                timestamp,
+                model_raw,
+                usage,
+                ingest_source="kimi_cli",
+            )
+            processed += 1
+
+    return processed
+
+
+def ingest_messages_from_offset(filepath: Path, conn, start_offset: int, session_id: str, source_key: str):
+    if source_key == "codex_cli":
         return ingest_codex_messages_from_offset(filepath, conn, start_offset, session_id)
-    return ingest_openclaw_messages_from_offset(filepath, conn, start_offset, session_id)
+    if source_key == "kimi_code":
+        return ingest_kimi_messages_from_offset(filepath, conn, start_offset, session_id)
+    return ingest_openclaw_messages_from_offset(
+        filepath, conn, start_offset, session_id, source_key
+    )
 
 
 def recompute_segments(conn, session_id: str):
@@ -710,10 +1561,12 @@ def recompute_segments(conn, session_id: str):
 
     cur.execute(
         """SELECT m.timestamp, mr.model_raw, m.input_tokens, m.output_tokens, m.cache_read, m.cache_write, m.total_tokens,
-                  m.cost_input, m.cost_output, m.cost_cache_read, m.cost_cache_write, m.cost_total
+                  m.cost_input, m.cost_output, m.cost_cache_read, m.cost_cache_write, m.cost_total,
+                  m.cost_is_estimated
            FROM messages m
            INNER JOIN model_reference mr ON mr.id = m.model_ref_id
            WHERE m.session_id = ?
+             AND COALESCE(m.is_excluded, 0) = 0
            ORDER BY m.timestamp ASC""",
         (session_id,)
     )
@@ -748,17 +1601,22 @@ def recompute_segments(conn, session_id: str):
             'cost_cache_write': sum(r[10] or 0 for r in seg_rows),
             'cost_total': sum(r[11] or 0 for r in seg_rows),
         }
+        segment_cost_is_estimated = 1 if any(r[12] for r in seg_rows) else 0
+        segment_cost_source = PIONEER_INPUT_ESTIMATE_SOURCE if segment_cost_is_estimated else ("ratecard" if agg['cost_total'] else None)
+        segment_cost_kind = "payg_estimated_input" if segment_cost_is_estimated else ("payg_equivalent" if agg['cost_total'] else None)
 
         ensure_model_reference(cur, seg_model)
         cur.execute(
             """INSERT OR REPLACE INTO segments
                (session_id, model_raw, segment_index, first_msg_ts, last_msg_ts, msg_count,
                 input_tokens, output_tokens, cache_read, cache_write, total_tokens,
-                cost_input, cost_output, cost_cache_read, cost_cache_write, cost_total)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                cost_input, cost_output, cost_cache_read, cost_cache_write, cost_total,
+                cost_source, cost_kind, cost_is_estimated)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (session_id, seg_model, segment_index, first_ts, last_ts, msg_count,
              agg['input_tokens'], agg['output_tokens'], agg['cache_read'], agg['cache_write'], agg['total_tokens'],
-             agg['cost_input'], agg['cost_output'], agg['cost_cache_read'], agg['cost_cache_write'], agg['cost_total'])
+             agg['cost_input'], agg['cost_output'], agg['cost_cache_read'], agg['cost_cache_write'], agg['cost_total'],
+             segment_cost_source, segment_cost_kind, segment_cost_is_estimated)
         )
         seg_rows = []
         segment_index += 1
@@ -775,6 +1633,340 @@ def recompute_segments(conn, session_id: str):
         seg_rows.append(row)
 
     flush()
+
+
+def backfill_message_ingest_sources(conn):
+    """Label archived rows using stable IDs and session storage paths.
+
+    Older tracker rows predate message-level provenance. The labels are
+    intentionally coarse but deterministic; new rows receive exact labels at
+    ingest time.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE messages
+        SET ingest_source = 'codex_app_server'
+        WHERE ingest_source IS NULL
+          AND id LIKE '%:codex:%'
+          AND EXISTS (
+              SELECT 1
+              FROM sessions s
+              WHERE s.session_id = messages.session_id
+                AND s.filename LIKE 'codex_cli:codex-home/%'
+          )
+        """
+    )
+    cur.execute(
+        """
+        UPDATE messages
+        SET ingest_source = 'codex_cli'
+        WHERE ingest_source IS NULL
+          AND id LIKE '%:codex:%'
+        """
+    )
+    cur.execute(
+        """
+        UPDATE messages
+        SET ingest_source = 'kimi_cli'
+        WHERE ingest_source IS NULL
+          AND id LIKE '%:kimi:%'
+        """
+    )
+    cur.execute(
+        """
+        UPDATE messages
+        SET ingest_source = 'claude_cli'
+        WHERE ingest_source IS NULL
+          AND EXISTS (
+              SELECT 1
+              FROM sessions s
+              WHERE s.session_id = messages.session_id
+                AND s.filename LIKE 'claude:%'
+          )
+        """
+    )
+    cur.execute(
+        """
+        UPDATE messages
+        SET ingest_source = 'openclaw_legacy'
+        WHERE ingest_source IS NULL
+        """
+    )
+    conn.commit()
+
+
+def propagate_claude_wrapper_provenance(conn):
+    """Give retained Claude usage the OpenClaw source that invoked it.
+
+    The accurate token row lives in the Claude transcript, while the excluded
+    wrapper row owns the Discord/GUI/subagent context. Propagate that context
+    only across an explicit duplicate pointer; unrelated manual Claude CLI
+    sessions remain labelled CLI.
+    """
+    cur = conn.cursor()
+    grouped = {}
+    for row in cur.execute(
+        """
+        SELECT
+            cli.session_id,
+            wrapper_session.session_type,
+            wrapper_session.channel_type,
+            wrapper_session.channel_name,
+            wrapper_session.parent_nickname
+        FROM messages wrapper
+        JOIN messages cli ON cli.id = wrapper.duplicate_of
+        JOIN sessions wrapper_session
+          ON wrapper_session.session_id = wrapper.session_id
+        WHERE wrapper.excluded_reason = 'duplicate_claude_wrapper_cli'
+          AND wrapper.is_excluded = 1
+          AND cli.session_id IS NOT NULL
+        """
+    ):
+        item = grouped.setdefault(
+            row[0],
+            {"sources": set(), "types": set(), "channels": set(), "labels": set()},
+        )
+        source = row[1]
+        if source:
+            item["sources"].add("openclaw" if source == "gui" else source)
+        if row[2]:
+            item["types"].add(row[2])
+        if row[3]:
+            item["channels"].add(row[3])
+        if row[4]:
+            item["labels"].add(row[4])
+
+    updated = 0
+    for session_id, item in grouped.items():
+        source = (
+            next(iter(item["sources"]))
+            if len(item["sources"]) == 1
+            else "openclaw"
+        )
+        channel_type = (
+            next(iter(item["types"])) if len(item["types"]) == 1 else None
+        )
+        channel_name = (
+            next(iter(item["channels"])) if len(item["channels"]) == 1 else None
+        )
+        label = next(iter(item["labels"])) if len(item["labels"]) == 1 else None
+        cur.execute(
+            """
+            UPDATE sessions
+            SET session_type = ?,
+                channel_type = COALESCE(?, channel_type),
+                channel_name = COALESCE(?, channel_name),
+                parent_nickname = COALESCE(?, parent_nickname)
+            WHERE session_id = ?
+              AND filename LIKE 'claude:%'
+            """,
+            (source, channel_type, channel_name, label, session_id),
+        )
+        updated += cur.rowcount
+    return updated
+
+
+def reconcile_usage_duplicates(conn, since="2026-07-01T00:00:00"):
+    """Exclude only high-confidence duplicate representations.
+
+    Raw message rows remain in the archive. Derived segments and dashboard
+    totals omit rows marked here and retain a pointer to the canonical row.
+    """
+    cur = conn.cursor()
+    reasons = (
+        "duplicate_codex_app_server_openclaw",
+        "duplicate_claude_wrapper_cli",
+    )
+    placeholders = ",".join("?" for _ in reasons)
+    cur.execute(
+        f"""
+        UPDATE messages
+        SET duplicate_of = NULL, excluded_reason = NULL, is_excluded = 0
+        WHERE excluded_reason IN ({placeholders})
+        """,
+        reasons,
+    )
+
+    cur.execute(
+        """
+        WITH candidates AS (
+            SELECT
+                cli.id AS duplicate_id,
+                oc.id AS canonical_id,
+                ABS((julianday(cli.timestamp) - julianday(oc.timestamp)) * 86400) AS time_gap
+            FROM messages cli
+            JOIN model_reference cli_model ON cli_model.id = cli.model_ref_id
+            JOIN messages oc
+              ON oc.timestamp >= ?
+             AND ABS((julianday(cli.timestamp) - julianday(oc.timestamp)) * 86400) < 2
+             AND COALESCE(cli.input_tokens, 0) = COALESCE(oc.input_tokens, 0)
+             AND COALESCE(cli.output_tokens, 0) = COALESCE(oc.output_tokens, 0)
+             AND COALESCE(cli.cache_read, 0) = COALESCE(oc.cache_read, 0)
+             AND COALESCE(cli.cache_write, 0) = COALESCE(oc.cache_write, 0)
+             AND COALESCE(cli.total_tokens, 0) = COALESCE(oc.total_tokens, 0)
+            JOIN model_reference oc_model ON oc_model.id = oc.model_ref_id
+            WHERE cli.ingest_source = 'codex_app_server'
+              AND cli.timestamp >= ?
+              AND oc.ingest_source LIKE 'openclaw%'
+              AND cli_model.model_raw LIKE 'codex_cli/%'
+              AND oc_model.model_raw =
+                  'openai/' || substr(cli_model.model_raw, length('codex_cli/') + 1)
+        ),
+        ranked AS (
+            SELECT
+                duplicate_id,
+                canonical_id,
+                ROW_NUMBER() OVER (
+                    PARTITION BY duplicate_id
+                    ORDER BY time_gap, canonical_id
+                ) AS duplicate_rank,
+                ROW_NUMBER() OVER (
+                    PARTITION BY canonical_id
+                    ORDER BY time_gap, duplicate_id
+                ) AS canonical_rank
+            FROM candidates
+        ),
+        matches AS (
+            SELECT duplicate_id, canonical_id
+            FROM ranked
+            WHERE duplicate_rank = 1 AND canonical_rank = 1
+        )
+        UPDATE messages
+        SET duplicate_of = (
+                SELECT canonical_id
+                FROM matches
+                WHERE duplicate_id = messages.id
+            ),
+            excluded_reason = 'duplicate_codex_app_server_openclaw',
+            is_excluded = 1
+        WHERE id IN (SELECT duplicate_id FROM matches)
+        """,
+        (since, since),
+    )
+
+    cur.execute(
+        """
+        WITH candidates AS (
+            SELECT
+                oc.id AS duplicate_id,
+                cli.id AS canonical_id,
+                ABS(
+                    COALESCE(cli.total_tokens, 0) -
+                    (
+                        COALESCE(oc.input_tokens, 0) +
+                        COALESCE(oc.output_tokens, 0) +
+                        COALESCE(oc.cache_read, 0) +
+                        COALESCE(oc.cache_write, 0)
+                    )
+                ) AS token_gap,
+                ABS((julianday(cli.timestamp) - julianday(oc.timestamp)) * 86400) AS time_gap
+            FROM messages oc
+            JOIN model_reference oc_model ON oc_model.id = oc.model_ref_id
+            JOIN messages cli
+              ON cli.timestamp >= ?
+             AND ABS((julianday(cli.timestamp) - julianday(oc.timestamp)) * 86400) < 2
+            JOIN model_reference cli_model ON cli_model.id = cli.model_ref_id
+            WHERE oc.ingest_source LIKE 'openclaw%'
+              AND oc.timestamp >= ?
+              AND cli.ingest_source = 'claude_cli'
+              AND oc_model.model_raw LIKE 'claude-cli/%'
+              AND cli_model.model_raw =
+                  'claude/' || substr(oc_model.model_raw, length('claude-cli/') + 1)
+              AND (
+                    COALESCE(oc.input_tokens, 0) +
+                    COALESCE(oc.output_tokens, 0) +
+                    COALESCE(oc.cache_read, 0) +
+                    COALESCE(oc.cache_write, 0)
+                  ) > 0
+              AND (
+                    ABS(
+                        COALESCE(cli.total_tokens, 0) -
+                        (
+                            COALESCE(oc.input_tokens, 0) +
+                            COALESCE(oc.output_tokens, 0) +
+                            COALESCE(oc.cache_read, 0) +
+                            COALESCE(oc.cache_write, 0)
+                        )
+                    ) * 1.0 /
+                    (
+                        COALESCE(oc.input_tokens, 0) +
+                        COALESCE(oc.output_tokens, 0) +
+                        COALESCE(oc.cache_read, 0) +
+                        COALESCE(oc.cache_write, 0)
+                    )
+                  ) < 0.10
+        ),
+        ranked AS (
+            SELECT
+                duplicate_id,
+                canonical_id,
+                ROW_NUMBER() OVER (
+                    PARTITION BY duplicate_id
+                    ORDER BY token_gap, time_gap, canonical_id
+                ) AS duplicate_rank,
+                ROW_NUMBER() OVER (
+                    PARTITION BY canonical_id
+                    ORDER BY token_gap, time_gap, duplicate_id
+                ) AS canonical_rank
+            FROM candidates
+        ),
+        matches AS (
+            SELECT duplicate_id, canonical_id
+            FROM ranked
+            WHERE duplicate_rank = 1 AND canonical_rank = 1
+        )
+        UPDATE messages
+        SET duplicate_of = (
+                SELECT canonical_id
+                FROM matches
+                WHERE duplicate_id = messages.id
+            ),
+            excluded_reason = 'duplicate_claude_wrapper_cli',
+            is_excluded = 1
+        WHERE id IN (SELECT duplicate_id FROM matches)
+        """,
+        (since, since),
+    )
+
+    rows = cur.execute(
+        """
+        SELECT excluded_reason, COUNT(*), COALESCE(SUM(total_tokens), 0)
+        FROM messages
+        WHERE is_excluded = 1
+          AND excluded_reason IN (?, ?)
+        GROUP BY excluded_reason
+        ORDER BY excluded_reason
+        """,
+        reasons,
+    ).fetchall()
+    touched_sessions = {
+        row[0]
+        for row in cur.execute(
+            """
+            SELECT DISTINCT session_id
+            FROM messages
+            WHERE is_excluded = 1
+              AND excluded_reason IN (?, ?)
+              AND session_id IS NOT NULL
+            """,
+            reasons,
+        )
+    }
+    for session_id in touched_sessions:
+        recompute_segments(conn, session_id)
+    propagate_claude_wrapper_provenance(conn)
+    conn.commit()
+
+    summary = {reason: {"calls": 0, "tokens": 0} for reason in reasons}
+    for reason, calls, tokens in rows:
+        summary[reason] = {"calls": int(calls), "tokens": int(tokens)}
+    print(
+        "✓ Reconciled duplicates: "
+        f"{summary['duplicate_codex_app_server_openclaw']['calls']} Codex, "
+        f"{summary['duplicate_claude_wrapper_cli']['calls']} Claude wrapper"
+    )
+    return touched_sessions, summary
 
 def extract_channel_info(user_text):
     """Extract channel info from user message text.
@@ -835,6 +2027,78 @@ def extract_channel_info(user_text):
         return None, "DM", "dm"
 
     return None, None, "gui"
+
+
+def extract_text_content(content):
+    """Return plain text from OpenClaw message.content across v2/v3 shapes."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text" and item.get("text"):
+                parts.append(str(item["text"]))
+        return "\n".join(parts).strip()
+    return ""
+
+
+def load_openclaw_session_index(force_refresh=False):
+    """Map OpenClaw session_id -> sessions.json metadata for current v3 logs."""
+    global _OPENCLAW_SESSION_INDEX_CACHE
+    if _OPENCLAW_SESSION_INDEX_CACHE is not None and not force_refresh:
+        return _OPENCLAW_SESSION_INDEX_CACHE
+
+    by_session_id = {}
+    if SESSIONS_INDEX_PATH.exists():
+        try:
+            with open(SESSIONS_INDEX_PATH, "r", encoding="utf-8") as f:
+                sessions = json.load(f)
+            if isinstance(sessions, dict):
+                for session_key, meta in sessions.items():
+                    if not isinstance(meta, dict):
+                        continue
+                    sid = meta.get("sessionId")
+                    if isinstance(sid, str) and sid:
+                        enriched = dict(meta)
+                        enriched["_sessionKey"] = session_key
+                        by_session_id[sid] = enriched
+        except Exception:
+            pass
+
+    _OPENCLAW_SESSION_INDEX_CACHE = by_session_id
+    return by_session_id
+
+
+def extract_route_info_from_session_index(session_id):
+    """Return channel metadata from sessions.json when prompt text no longer embeds it."""
+    meta = load_openclaw_session_index().get(session_id)
+    if not meta:
+        return None, None, "gui", None
+
+    channel = meta.get("channel") or meta.get("lastChannel")
+    chat_type = meta.get("chatType")
+    group_id = meta.get("groupId")
+    display_name = meta.get("displayName") or ""
+    session_key = meta.get("_sessionKey") or ""
+
+    surface = channel if channel in ("discord", "telegram") else "gui"
+    if chat_type == "direct":
+        surface = "dm"
+
+    channel_id = str(group_id) if group_id else None
+    channel_name = None
+    if channel_id:
+        channel_name = CHANNEL_ID_TO_NAME.get(channel_id)
+    if not channel_name and "#" in display_name:
+        channel_name = "#" + display_name.rsplit("#", 1)[-1]
+    if not channel_name and ":channel:" in session_key:
+        channel_id = session_key.rsplit(":channel:", 1)[-1]
+        channel_name = CHANNEL_ID_TO_NAME.get(channel_id, f"#{channel_id}")
+    if not channel_name and surface == "dm":
+        channel_name = "DM"
+
+    source = surface if surface in ("discord", "telegram", "dm") else None
+    return channel_id, channel_name, surface, source
 
 
 def extract_cron_info(user_text):
@@ -999,9 +2263,534 @@ def detect_deleted(filename):
     return False, None
 
 
-def parse_openclaw_session_file(filepath, conn, logical_filename: str):
-    """Parse a single session file and insert into database."""
-    filename = logical_filename
+def get_session_storage_name(filepath: Path, source: str) -> str:
+    """Stable storage key for session files across multiple source roots.
+
+    Main OpenClaw logs deliberately keep their historical bare filename keys so
+    existing ingest_state rows remain valid. Other roots get a source prefix to
+    avoid basename collisions (for example fastbot:<uuid>.jsonl).
+    """
+    if source == "claude":
+        try:
+            rel = filepath.relative_to(CLAUDE_PROJECTS_DIR)
+            return f"claude:{rel.as_posix()}"
+        except ValueError:
+            return f"claude:{filepath.name}"
+    if source == "codex_cli":
+        app_root = codex_app_server_root_for(filepath)
+        if app_root:
+            rel = Path(filepath).resolve().relative_to(app_root["dir"].resolve())
+            return f"codex_cli:codex-home/{app_root['agent']}/{rel.as_posix()}"
+        try:
+            rel = filepath.resolve().relative_to(CODEX_SESSIONS_DIR.resolve())
+            return f"codex_cli:{rel.as_posix()}"
+        except ValueError:
+            return f"codex_cli:{filepath.name}"
+    if source == "kimi_code":
+        try:
+            rel = filepath.resolve().relative_to(KIMI_CODE_DIR.resolve())
+            return f"kimi_code:{rel.as_posix()}"
+        except ValueError:
+            return f"kimi_code:{filepath.name}"
+    if source == "main":
+        return os.path.basename(filepath)
+    return f"{source}:{os.path.basename(filepath)}"
+
+
+def is_openclaw_session_log(filepath: Path) -> bool:
+    """True for normal OpenClaw session logs; false for trajectory sidecars."""
+    name = filepath.name
+    if name.endswith(".trajectory.jsonl") or name.endswith(".trajectory-path.json") or name.endswith(".zst"):
+        return False
+    return name.endswith(".jsonl") or ".jsonl.deleted." in name or ".jsonl.reset." in name
+
+
+def collect_openclaw_session_files(source: dict):
+    sessions_dir = source["dir"]
+    if not sessions_dir.exists():
+        return []
+    session_files = [p for p in sessions_dir.glob("*.jsonl") if is_openclaw_session_log(p)]
+    deleted_files = [p for p in sessions_dir.glob("*.jsonl.deleted.*") if is_openclaw_session_log(p)]
+    reset_files = [p for p in sessions_dir.glob("*.jsonl.reset.*") if is_openclaw_session_log(p)]
+    return sorted(session_files) + sorted(deleted_files) + sorted(reset_files)
+
+
+def collect_codex_session_files():
+    files = []
+    if CODEX_SESSIONS_DIR.exists():
+        files.extend(CODEX_SESSIONS_DIR.rglob("*.jsonl"))
+    for root in codex_app_server_roots():
+        files.extend(root["dir"].rglob("*.jsonl"))
+    return sorted(files)
+
+
+def collect_kimi_session_files():
+    sessions_dir = KIMI_CODE_DIR / "sessions"
+    if not sessions_dir.exists():
+        return []
+    return sorted(sessions_dir.glob("*/session_*/agents/*/wire.jsonl"))
+
+
+def collect_openclaw_sqlite_sources():
+    """Return live per-agent OpenClaw SQLite session stores."""
+    sources = []
+    if not OPENCLAW_AGENTS_DIR.exists():
+        return sources
+    for agent_dir in sorted(OPENCLAW_AGENTS_DIR.iterdir()):
+        db_path = agent_dir / "agent" / "openclaw-agent.sqlite"
+        if db_path.is_file():
+            sources.append({"agent": agent_dir.name, "path": db_path})
+    return sources
+
+
+def _iso_from_millis(value):
+    try:
+        return datetime.fromtimestamp(float(value) / 1000, timezone.utc).isoformat(
+            timespec="milliseconds"
+        ).replace("+00:00", "Z")
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def _openclaw_sqlite_session_metadata(row):
+    entry = {}
+    try:
+        parsed = json.loads(row["entry_json"] or "{}")
+        if isinstance(parsed, dict):
+            entry = parsed
+    except (TypeError, json.JSONDecodeError):
+        pass
+
+    session_key = row["session_key"] or ""
+    delivery = entry.get("delivery") if isinstance(entry.get("delivery"), dict) else {}
+    origin = delivery.get("origin") if isinstance(delivery.get("origin"), dict) else {}
+    display_name = entry.get("displayName") or row["display_name"]
+    label = row["label"] or entry.get("label")
+
+    channel_id = origin.get("nativeChannelId")
+    if not channel_id:
+        match = re.search(r":channel:(\d+)$", session_key)
+        channel_id = match.group(1) if match else None
+
+    channel_name = CHANNEL_ID_TO_NAME.get(str(channel_id)) if channel_id else None
+    if not channel_name and isinstance(display_name, str):
+        match = re.search(r"(#[^\s]+)$", display_name)
+        channel_name = match.group(1) if match else None
+
+    if ":discord:" in session_key:
+        channel_type = "discord"
+    elif ":telegram:" in session_key:
+        channel_type = "telegram"
+    elif origin.get("surface"):
+        channel_type = origin.get("surface")
+    else:
+        channel_type = "gui"
+
+    if ":subagent:" in session_key:
+        session_type = "subagent"
+    elif ":cron:" in session_key:
+        session_type = "cron"
+    elif ":acp:" in session_key:
+        session_type = "acp"
+    elif ":discord:" in session_key:
+        session_type = "discord"
+    elif ":telegram:" in session_key:
+        session_type = "telegram"
+    else:
+        session_type = "gui"
+
+    return {
+        "parent_nickname": label,
+        "created_at": _iso_from_millis(entry.get("createdAt") or row["created_at"]),
+        "channel_id": str(channel_id) if channel_id else None,
+        "channel_name": channel_name,
+        "channel_type": channel_type,
+        "session_type": session_type,
+    }
+
+
+def ingest_openclaw_sqlite(conn):
+    """Incrementally import usage-bearing assistant events from OpenClaw SQLite.
+
+    Existing OpenClaw JSONL message ids are preserved in SQLite, so the tracker
+    primary key naturally replaces old copies instead of duplicating them.
+    """
+    tracker_cur = conn.cursor()
+    touched_session_ids = set()
+    total_events = 0
+    total_new_events = 0
+    processed_sources = 0
+
+    for source in collect_openclaw_sqlite_sources():
+        agent_id = source["agent"]
+        db_path = source["path"]
+        storage_name = f"openclaw_sqlite:{agent_id}:{db_path}"
+        state = get_ingest_state(tracker_cur, storage_name)
+        last_rowid = int(state.get("last_offset") or 0) if state else 0
+
+        source_conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        source_conn.row_factory = sqlite3.Row
+        try:
+            node_metadata = {}
+            for node in source_conn.execute(
+                """
+                SELECT session_key, current_session_id, entry_json, created_at,
+                       label, display_name
+                FROM session_nodes
+                """
+            ):
+                if node["current_session_id"]:
+                    node_metadata[node["current_session_id"]] = _openclaw_sqlite_session_metadata(node)
+
+            rows = source_conn.execute(
+                """
+                SELECT rowid, session_id, seq, event_json, created_at
+                FROM transcript_events
+                WHERE rowid > ?
+                ORDER BY rowid
+                """,
+                (last_rowid,),
+            ).fetchall()
+            if not rows:
+                continue
+
+            max_rowid = last_rowid
+            for row in rows:
+                max_rowid = max(max_rowid, int(row["rowid"]))
+                try:
+                    event = json.loads(row["event_json"])
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                message = event.get("message") if isinstance(event.get("message"), dict) else {}
+                usage = message.get("usage") if isinstance(message.get("usage"), dict) else {}
+                if event.get("type") != "message" or message.get("role") != "assistant":
+                    continue
+                if not any(
+                    usage.get(key, 0) or 0
+                    for key in ("input", "output", "cacheRead", "cacheWrite", "totalTokens")
+                ):
+                    continue
+
+                session_id = row["session_id"]
+                timestamp = event.get("timestamp") or message.get("timestamp")
+                metadata = node_metadata.get(session_id, {})
+                created_at = metadata.get("created_at") or timestamp or _iso_from_millis(row["created_at"])
+                session_nickname = session_id[9:13] if session_id and len(session_id) >= 13 else session_id
+                tracker_cur.execute(
+                    """
+                    INSERT OR IGNORE INTO sessions
+                    (session_id, session_nickname, parent_nickname, filename, created_at,
+                     channel_id, channel_name, channel_type, session_type, deleted_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                    """,
+                    (
+                        session_id,
+                        session_nickname,
+                        metadata.get("parent_nickname"),
+                        storage_name,
+                        created_at,
+                        metadata.get("channel_id"),
+                        metadata.get("channel_name"),
+                        metadata.get("channel_type") or "gui",
+                        metadata.get("session_type") or "gui",
+                    ),
+                )
+                tracker_cur.execute(
+                    """
+                    UPDATE sessions
+                    SET parent_nickname = COALESCE(parent_nickname, ?),
+                        channel_id = COALESCE(channel_id, ?),
+                        channel_name = COALESCE(channel_name, ?),
+                        channel_type = COALESCE(channel_type, ?),
+                        session_type = COALESCE(session_type, ?)
+                    WHERE session_id = ?
+                    """,
+                    (
+                        metadata.get("parent_nickname"),
+                        metadata.get("channel_id"),
+                        metadata.get("channel_name"),
+                        metadata.get("channel_type"),
+                        metadata.get("session_type"),
+                        session_id,
+                    ),
+                )
+
+                msg_id = event.get("id") or f"openclaw-sqlite:{agent_id}:{session_id}:{row['seq']}"
+                existed = tracker_cur.execute(
+                    "SELECT 1 FROM messages WHERE id = ?",
+                    (msg_id,),
+                ).fetchone() is not None
+                provider = message.get("provider") or "unknown"
+                model_raw = f"{provider}/{message.get('model') or 'unknown'}"
+                source_cost = usage.get("cost") if isinstance(usage.get("cost"), dict) else {}
+                insert_message_row(
+                    tracker_cur,
+                    msg_id,
+                    session_id,
+                    event.get("parentId"),
+                    timestamp,
+                    model_raw,
+                    {
+                        "input_tokens": usage.get("input", 0) or 0,
+                        "output_tokens": usage.get("output", 0) or 0,
+                        "cache_read": usage.get("cacheRead", 0) or 0,
+                        "cache_write": usage.get("cacheWrite", 0) or 0,
+                        "total_tokens": usage.get("totalTokens", 0) or 0,
+                    },
+                    {
+                        "input": source_cost.get("input", 0) or 0,
+                        "output": source_cost.get("output", 0) or 0,
+                        "cacheRead": source_cost.get("cacheRead", 0) or 0,
+                        "cacheWrite": source_cost.get("cacheWrite", 0) or 0,
+                        "total": source_cost.get("total", 0) or 0,
+                    },
+                    ingest_source=f"openclaw_sqlite:{agent_id}",
+                )
+                touched_session_ids.add(session_id)
+                total_events += 1
+                if not existed:
+                    total_new_events += 1
+
+            for session_id in touched_session_ids:
+                recompute_segments(conn, session_id)
+            stat = db_path.stat()
+            update_ingest_state(
+                tracker_cur,
+                storage_name,
+                agent_id,
+                max_rowid,
+                stat.st_size,
+                stat.st_mtime,
+            )
+            processed_sources += 1
+            conn.commit()
+        finally:
+            source_conn.close()
+
+    print(
+        f"✓ OpenClaw SQLite: {total_events} usage events processed "
+        f"({total_new_events} new) from {processed_sources} source(s)"
+    )
+    return touched_session_ids
+
+
+def extract_claude_user_text(data):
+    """Extract plain user text from Claude Code log rows."""
+    if data.get("type") != "user":
+        return None
+    message = data.get("message") or {}
+    if message.get("role") != "user":
+        return None
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if item.get("type") == "text" and item.get("text"):
+                parts.append(item["text"])
+        return "\n".join(parts).strip() or None
+    return None
+
+
+def normalize_claude_assistant_row(data):
+    """Map a Claude Code assistant row to the existing DB message shape."""
+    if data.get("type") != "assistant":
+        return None
+
+    msg = data.get("message") or {}
+    if msg.get("role") != "assistant":
+        return None
+
+    usage = msg.get("usage") or {}
+    request_id = data.get("requestId")
+    message_id = msg.get("id")
+    row_id = request_id or message_id or data.get("uuid")
+    model = msg.get("model") or "unknown"
+    timestamp = data.get("timestamp")
+
+    if not row_id or not timestamp:
+        return None
+
+    input_tokens = int(usage.get("input_tokens") or 0)
+    output_tokens = int(usage.get("output_tokens") or 0)
+    cache_read = int(usage.get("cache_read_input_tokens") or 0)
+    cache_write = int(usage.get("cache_creation_input_tokens") or 0)
+    total_tokens = input_tokens + output_tokens + cache_read + cache_write
+
+    model_raw = f"claude/{model}"
+    usage_norm = {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_read": cache_read,
+        "cache_write": cache_write,
+        "total_tokens": total_tokens,
+    }
+    cost = maybe_calculate_cli_cost(model_raw, usage_norm, None)
+
+    return {
+        "id": row_id,
+        "parent_id": data.get("parentUuid"),
+        "timestamp": timestamp,
+        "model_raw": model_raw,
+        **usage_norm,
+        "cost_input": cost.get("input", 0),
+        "cost_output": cost.get("output", 0),
+        "cost_cache_read": cost.get("cacheRead", 0),
+        "cost_cache_write": cost.get("cacheWrite", 0),
+        "cost_total": cost.get("total", 0),
+    }
+
+
+def parse_claude_session_file(filepath, conn):
+    """Parse a Claude Code session JSONL and upsert into the existing schema."""
+    storage_name = get_session_storage_name(Path(filepath), "claude")
+    cur = conn.cursor()
+
+    session_id = None
+    session_nickname = None
+    created_at = None
+    first_user_text = None
+    cwd = None
+    message_count = 0
+    current_model_raw = None
+    segment_index = 0
+    segment_msgs = []
+    seen_row_ids = set()
+
+    def flush_segment():
+        nonlocal segment_msgs, segment_index
+        if not segment_msgs or not session_id:
+            return
+        first_ts = min(m["timestamp"] for m in segment_msgs)
+        last_ts = max(m["timestamp"] for m in segment_msgs)
+        agg = {
+            "input_tokens": sum(m["input_tokens"] for m in segment_msgs),
+            "output_tokens": sum(m["output_tokens"] for m in segment_msgs),
+            "cache_read": sum(m["cache_read"] for m in segment_msgs),
+            "cache_write": sum(m["cache_write"] for m in segment_msgs),
+            "total_tokens": sum(m["total_tokens"] for m in segment_msgs),
+            "cost_input": sum(m["cost_input"] for m in segment_msgs),
+            "cost_output": sum(m["cost_output"] for m in segment_msgs),
+            "cost_cache_read": sum(m["cost_cache_read"] for m in segment_msgs),
+            "cost_cache_write": sum(m["cost_cache_write"] for m in segment_msgs),
+            "cost_total": sum(m["cost_total"] for m in segment_msgs),
+        }
+        ensure_model_reference(cur, segment_msgs[0]["model_raw"])
+        cur.execute("""
+            INSERT OR REPLACE INTO segments
+            (session_id, model_raw, segment_index, first_msg_ts, last_msg_ts, msg_count,
+             input_tokens, output_tokens, cache_read, cache_write, total_tokens,
+             cost_input, cost_output, cost_cache_read, cost_cache_write, cost_total,
+             cost_source, cost_kind, cost_is_estimated)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (session_id, segment_msgs[0]["model_raw"], segment_index, first_ts, last_ts, len(segment_msgs),
+              agg["input_tokens"], agg["output_tokens"], agg["cache_read"], agg["cache_write"], agg["total_tokens"],
+              agg["cost_input"], agg["cost_output"], agg["cost_cache_read"], agg["cost_cache_write"], agg["cost_total"],
+              "ratecard" if agg["cost_total"] else None,
+              "payg_equivalent" if agg["cost_total"] else None,
+              0 if agg["cost_total"] else None))
+        segment_msgs = []
+        segment_index += 1
+
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                session_id = session_id or data.get("sessionId")
+                cwd = cwd or data.get("cwd")
+                ts = data.get("timestamp")
+                if ts and (created_at is None or ts < created_at):
+                    created_at = ts
+
+                user_text = extract_claude_user_text(data)
+                if user_text and first_user_text is None:
+                    first_user_text = user_text
+
+                row = normalize_claude_assistant_row(data)
+                if not row or row["id"] in seen_row_ids:
+                    continue
+                row["id"] = f"{session_id or data.get('sessionId') or 'claude'}:{row['id']}"
+                seen_row_ids.add(row["id"])
+
+                if session_id and session_nickname is None:
+                    session_nickname = session_id[9:13] if len(session_id) >= 13 else session_id
+                    cur.execute(
+                        """INSERT OR IGNORE INTO sessions
+                           (session_id, session_nickname, filename, created_at, channel_type, session_type)
+                           VALUES (?, ?, ?, ?, ?, ?)""",
+                        (session_id, session_nickname, storage_name, created_at, "gui", "gui")
+                    )
+
+                model_ref_id = get_model_ref_id(cur, row["model_raw"])
+                cur.execute("""
+                    INSERT OR REPLACE INTO messages
+                    (id, session_id, parent_id, timestamp, model_ref_id,
+                     input_tokens, output_tokens, cache_read, cache_write, total_tokens,
+                     cost_input, cost_output, cost_cache_read, cost_cache_write, cost_total,
+                     cost_source, cost_kind, cost_is_estimated, ingest_source,
+                     duplicate_of, excluded_reason, is_excluded)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                            NULL, NULL, 0)
+                """, (row["id"], session_id, row["parent_id"], row["timestamp"], model_ref_id,
+                      row["input_tokens"], row["output_tokens"], row["cache_read"], row["cache_write"], row["total_tokens"],
+                      row["cost_input"], row["cost_output"], row["cost_cache_read"], row["cost_cache_write"], row["cost_total"],
+                      "ratecard" if row["cost_total"] else None,
+                      "payg_equivalent" if row["cost_total"] else None,
+                      0 if row["cost_total"] else None,
+                      "claude_cli"))
+
+                if current_model_raw is not None and row["model_raw"] != current_model_raw:
+                    flush_segment()
+                current_model_raw = row["model_raw"]
+                segment_msgs.append(row)
+                message_count += 1
+
+        flush_segment()
+
+        if session_id:
+            label = None
+            if cwd:
+                label = Path(cwd).name or None
+            cur.execute("""
+                INSERT OR REPLACE INTO sessions
+                (session_id, session_nickname, parent_nickname, filename, created_at,
+                 channel_id, channel_name, channel_type, session_type, deleted_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (session_id, session_nickname, label, storage_name, created_at,
+                  None, None, "gui", "gui", None))
+            return True, message_count, session_id
+    except Exception as e:
+        print(f"  Error reading Claude session {filepath}: {e}")
+        return False, 0, None
+
+    return False, 0, None
+
+
+def collect_claude_session_files():
+    if not CLAUDE_PROJECTS_DIR.exists():
+        return []
+    files = []
+    for path in CLAUDE_PROJECTS_DIR.rglob("*.jsonl"):
+        if "subagents" in path.parts:
+            continue
+        files.append(path)
+    return sorted(files)
+
+
+def parse_session_file(filepath, conn, source_key="main"):
+    """Parse a single OpenClaw session file and insert into database."""
+    if source_key == "codex_cli":
+        return parse_codex_session_file(filepath, conn)
+    if source_key == "kimi_code":
+        return parse_kimi_session_file(filepath, conn)
+    filepath = Path(filepath)
+    filename = os.path.basename(filepath)
+    storage_name = get_session_storage_name(filepath, source_key)
     cur = conn.cursor()
 
     session_id = None
@@ -1045,16 +2834,21 @@ def parse_openclaw_session_file(filepath, conn, logical_filename: str):
             'cost_cache_write': sum(m['cost_cache_write'] for m in segment_msgs),
             'cost_total': sum(m['cost_total'] for m in segment_msgs),
         }
+        segment_cost_is_estimated = 1 if any(m.get('cost_is_estimated') for m in segment_msgs) else 0
+        segment_cost_source = PIONEER_INPUT_ESTIMATE_SOURCE if segment_cost_is_estimated else None
+        segment_cost_kind = "payg_estimated_input" if segment_cost_is_estimated else None
         ensure_model_reference(cur, segment_msgs[0]['model_raw'])
         cur.execute("""
             INSERT OR REPLACE INTO segments
             (session_id, model_raw, segment_index, first_msg_ts, last_msg_ts, msg_count,
              input_tokens, output_tokens, cache_read, cache_write, total_tokens,
-             cost_input, cost_output, cost_cache_read, cost_cache_write, cost_total)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             cost_input, cost_output, cost_cache_read, cost_cache_write, cost_total,
+             cost_source, cost_kind, cost_is_estimated)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (session_id, segment_msgs[0]['model_raw'], segment_index, first_ts, last_ts, len(segment_msgs),
               agg['input_tokens'], agg['output_tokens'], agg['cache_read'], agg['cache_write'], agg['total_tokens'],
-              agg['cost_input'], agg['cost_output'], agg['cost_cache_read'], agg['cost_cache_write'], agg['cost_total']))
+              agg['cost_input'], agg['cost_output'], agg['cost_cache_read'], agg['cost_cache_write'], agg['cost_total'],
+              segment_cost_source, segment_cost_kind, segment_cost_is_estimated))
         segment_msgs = []
         segment_index += 1
 
@@ -1077,24 +2871,25 @@ def parse_openclaw_session_file(filepath, conn, logical_filename: str):
                                 """INSERT OR IGNORE INTO sessions
                                    (session_id, session_nickname, filename, created_at)
                                    VALUES (?, ?, ?, ?)""",
-                                (session_id, session_nickname, filename, created_at)
+                                (session_id, session_nickname, storage_name, created_at)
                             )
 
                     # User message - extract channel info + capture first user text
                     elif data.get("type") == "message" and data.get("message", {}).get("role") == "user":
-                        content = data.get("message", {}).get("content", [])
-                        if content and content[0].get("type") == "text":
-                            user_text = content[0].get("text", "")
-                            # Capture first user text for classification
-                            if first_user_text is None:
-                                first_user_text = user_text
-                            cid, cname, csurf = extract_channel_info(user_text)
-                            if cid:
-                                channel_id = cid
-                            if cname:
-                                channel_name = cname
-                            if csurf != "gui":
-                                surface = csurf
+                        msg = data.get("message", {})
+                        user_text = extract_text_content(msg.get("content"))
+                        # Capture first user text for classification
+                        if user_text and first_user_text is None:
+                            first_user_text = user_text
+                        cid, cname, csurf = extract_channel_info(user_text)
+                        if cid:
+                            channel_id = cid
+                        if cname:
+                            channel_name = cname
+                        if csurf != "gui":
+                            surface = csurf
+                        elif msg.get("sourceChannel") in ("discord", "telegram"):
+                            surface = msg.get("sourceChannel")
 
                     # Assistant message - token/cost data
                     elif data.get("type") == "message" and data.get("message", {}).get("role") == "assistant":
@@ -1106,17 +2901,30 @@ def parse_openclaw_session_file(filepath, conn, logical_filename: str):
                         provider = msg.get("provider", "unknown")
                         model_raw = f"{provider}/{msg.get('model', 'unknown')}"
 
+                        # FK safety: keep model_reference in sync with new/unknown models.
+                        model_ref_id = get_model_ref_id(cur, model_raw)
+
                         # Skip openclaw/delivery-mirror - don't create segments for these
                         is_mirror = provider == "openclaw" and model_raw.endswith("/delivery-mirror")
 
                         usage = msg.get("usage", {})
-                        input_tokens = usage.get("input", 0)
-                        output_tokens = usage.get("output", 0)
-                        cache_read = usage.get("cacheRead", 0)
-                        cache_write = usage.get("cacheWrite", 0)
-                        total_tokens = usage.get("totalTokens", 0)
+                        usage_norm = {
+                            "input_tokens": usage.get("input", 0),
+                            "output_tokens": usage.get("output", 0),
+                            "cache_read": usage.get("cacheRead", 0),
+                            "cache_write": usage.get("cacheWrite", 0),
+                            "total_tokens": usage.get("totalTokens", 0),
+                        }
 
                         cost = usage.get("cost", {})
+                        usage_norm, cost, cost_source, cost_kind, cost_is_estimated = apply_pioneer_input_estimate(
+                            model_raw, timestamp, usage_norm, cost
+                        )
+                        input_tokens = usage_norm.get("input_tokens", 0)
+                        output_tokens = usage_norm.get("output_tokens", 0)
+                        cache_read = usage_norm.get("cache_read", 0)
+                        cache_write = usage_norm.get("cache_write", 0)
+                        total_tokens = usage_norm.get("total_tokens", 0)
                         cost_input = cost.get("input", 0) if cost else 0
                         cost_output = cost.get("output", 0) if cost else 0
                         cost_cache_read = cost.get("cacheRead", 0) if cost else 0
@@ -1124,28 +2932,20 @@ def parse_openclaw_session_file(filepath, conn, logical_filename: str):
                         cost_total = cost.get("total", 0) if cost else 0
 
                         # Insert message (still record mirror messages, just don't segment on them)
-                        insert_message_row(
-                            cur,
-                            msg_id,
-                            session_id,
-                            parent_id,
-                            timestamp,
-                            model_raw,
-                            {
-                                'input_tokens': input_tokens,
-                                'output_tokens': output_tokens,
-                                'cache_read': cache_read,
-                                'cache_write': cache_write,
-                                'total_tokens': total_tokens,
-                            },
-                            {
-                                'input': cost_input,
-                                'output': cost_output,
-                                'cacheRead': cost_cache_read,
-                                'cacheWrite': cost_cache_write,
-                                'total': cost_total,
-                            },
-                        )
+                        cur.execute("""
+                            INSERT OR REPLACE INTO messages
+                            (id, session_id, parent_id, timestamp, model_ref_id,
+                             input_tokens, output_tokens, cache_read, cache_write, total_tokens,
+                             cost_input, cost_output, cost_cache_read, cost_cache_write, cost_total,
+                             cost_source, cost_kind, cost_is_estimated, ingest_source,
+                             duplicate_of, excluded_reason, is_excluded)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                                    NULL, NULL, 0)
+                        """, (msg_id, session_id, parent_id, timestamp, model_ref_id,
+                              input_tokens, output_tokens, cache_read, cache_write, total_tokens,
+                              cost_input, cost_output, cost_cache_read, cost_cache_write, cost_total,
+                              cost_source, cost_kind, cost_is_estimated,
+                              f"openclaw_jsonl:{source_key}"))
 
                         # Skip mirror messages for segment tracking
                         if is_mirror:
@@ -1170,6 +2970,9 @@ def parse_openclaw_session_file(filepath, conn, logical_filename: str):
                             'cost_cache_read': cost_cache_read,
                             'cost_cache_write': cost_cache_write,
                             'cost_total': cost_total,
+                            'cost_source': cost_source,
+                            'cost_kind': cost_kind,
+                            'cost_is_estimated': cost_is_estimated,
                         })
 
                         message_count += 1
@@ -1188,6 +2991,14 @@ def parse_openclaw_session_file(filepath, conn, logical_filename: str):
         if insert_errors:
             print(f"  WARNING: {insert_errors} line(s) failed during parsing of {filename}")
         if session_id:
+            indexed_channel_id, indexed_channel_name, indexed_surface, indexed_source = extract_route_info_from_session_index(session_id)
+            if indexed_channel_id and not channel_id:
+                channel_id = indexed_channel_id
+            if indexed_channel_name and not channel_name:
+                channel_name = indexed_channel_name
+            if indexed_surface != "gui" and surface == "gui":
+                surface = indexed_surface
+
             # Look up channel name from ID if we have ID but no name
             if channel_id and not channel_name:
                 channel_name = CHANNEL_ID_TO_NAME.get(channel_id, f"#{channel_id}")
@@ -1195,16 +3006,23 @@ def parse_openclaw_session_file(filepath, conn, logical_filename: str):
             # Classify source and label
             source, label = infer_source_and_label(first_user_text, filename)
 
+            if source_key == "fastbot":
+                source = "agent"
+                label = "fastbot"
+                channel_name = "fastbot"
+                surface = "agent"
             # If source is still "gui" but we detected a surface, upgrade it
-            if source == "gui" and surface in ("discord", "telegram", "dm"):
+            elif source == "gui" and surface in ("discord", "telegram", "dm"):
                 source = surface
+            elif source == "gui" and indexed_source:
+                source = indexed_source
 
             cur.execute("""
                 INSERT OR REPLACE INTO sessions
                 (session_id, session_nickname, parent_nickname, filename, created_at,
                  channel_id, channel_name, channel_type, session_type, deleted_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (session_id, session_nickname, label, filename, created_at,
+            """, (session_id, session_nickname, label, storage_name, created_at,
                   channel_id, channel_name, surface, source, deleted_at))
 
             return True, message_count, session_id
@@ -1216,12 +3034,24 @@ def parse_openclaw_session_file(filepath, conn, logical_filename: str):
     return False, 0, None
 
 
-def parse_codex_session_file(filepath, conn, logical_filename: str):
+def parse_codex_session_file(filepath, conn):
     """Parse a Codex CLI transcript and normalize token-count events into assistant usage rows."""
-    filename = logical_filename
+    filepath = Path(filepath)
+    filename = get_session_storage_name(filepath, "codex_cli")
     cur = conn.cursor()
 
-    session_id = extract_codex_session_id_from_path(filepath)
+    session_id = extract_codex_session_id_from_file(filepath)
+    # App-server rollouts under agent codex-home are the authoritative usage
+    # source: OpenClaw message logs record mostly zero usage for harness turns,
+    # so do NOT skip them as "already covered by OpenClaw logs". Classic
+    # ~/.codex/sessions files keep the old skip behaviour.
+    if (
+        session_id
+        and not codex_app_server_root_for(filepath)
+        and session_id in collect_openclaw_codex_thread_ids()
+    ):
+        return True, 0, session_id
+
     session_nickname = session_id[9:13] if session_id and len(session_id) >= 13 else session_id
     created_at = None
     message_count = 0
@@ -1230,6 +3060,7 @@ def parse_codex_session_file(filepath, conn, logical_filename: str):
     current_model_raw = None
     segment_index = 0
     segment_msgs = []
+    seen_token_count_states = set()
     source_label = "codex_cli"
 
     def ensure_session_stub():
@@ -1254,6 +3085,11 @@ def parse_codex_session_file(filepath, conn, logical_filename: str):
             'cache_read': sum(m['cache_read'] for m in segment_msgs),
             'cache_write': sum(m['cache_write'] for m in segment_msgs),
             'total_tokens': sum(m['total_tokens'] for m in segment_msgs),
+            'cost_input': sum(m.get('cost_input', 0) for m in segment_msgs),
+            'cost_output': sum(m.get('cost_output', 0) for m in segment_msgs),
+            'cost_cache_read': sum(m.get('cost_cache_read', 0) for m in segment_msgs),
+            'cost_cache_write': sum(m.get('cost_cache_write', 0) for m in segment_msgs),
+            'cost_total': sum(m.get('cost_total', 0) for m in segment_msgs),
         }
         ensure_model_reference(cur, segment_msgs[0]['model_raw'])
         cur.execute(
@@ -1261,8 +3097,9 @@ def parse_codex_session_file(filepath, conn, logical_filename: str):
             INSERT OR REPLACE INTO segments
             (session_id, model_raw, segment_index, first_msg_ts, last_msg_ts, msg_count,
              input_tokens, output_tokens, cache_read, cache_write, total_tokens,
-             cost_input, cost_output, cost_cache_read, cost_cache_write, cost_total)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0)
+             cost_input, cost_output, cost_cache_read, cost_cache_write, cost_total,
+             cost_source, cost_kind, cost_is_estimated)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 session_id,
@@ -1276,6 +3113,14 @@ def parse_codex_session_file(filepath, conn, logical_filename: str):
                 agg['cache_read'],
                 agg['cache_write'],
                 agg['total_tokens'],
+                agg['cost_input'],
+                agg['cost_output'],
+                agg['cost_cache_read'],
+                agg['cost_cache_write'],
+                agg['cost_total'],
+                'ratecard' if agg['cost_total'] else None,
+                'payg_equivalent' if agg['cost_total'] else None,
+                0 if agg['cost_total'] else None,
             ),
         )
         segment_msgs = []
@@ -1300,7 +3145,7 @@ def parse_codex_session_file(filepath, conn, logical_filename: str):
                     session_id = payload.get("id") or session_id or extract_codex_session_id_from_path(filepath)
                     session_nickname = session_id[9:13] if session_id and len(session_id) >= 13 else session_id
                     created_at = payload.get("timestamp") or data.get("timestamp") or created_at
-                    source_label = payload.get("source") or source_label
+                    source_label = normalize_codex_source_label(payload.get("source") or source_label)
                     ensure_session_stub()
                     continue
 
@@ -1311,6 +3156,10 @@ def parse_codex_session_file(filepath, conn, logical_filename: str):
                 last_usage = info.get("last_token_usage")
                 if not isinstance(last_usage, dict):
                     continue
+                dedupe_key = codex_token_count_dedupe_key(info)
+                if dedupe_key in seen_token_count_states:
+                    continue
+                seen_token_count_states.add(dedupe_key)
 
                 if not session_id:
                     session_id = extract_codex_session_id_from_path(filepath)
@@ -1322,6 +3171,7 @@ def parse_codex_session_file(filepath, conn, logical_filename: str):
                 model_raw = f"codex_cli/{current_model or 'unknown'}"
                 timestamp = data.get("timestamp")
                 msg_id = f"{session_id}:codex:{line_num}"
+                normalized_usage = normalize_codex_usage(last_usage)
                 insert_message_row(
                     cur,
                     msg_id,
@@ -1329,26 +3179,27 @@ def parse_codex_session_file(filepath, conn, logical_filename: str):
                     None,
                     timestamp,
                     model_raw,
-                    {
-                        'input_tokens': last_usage.get('input_tokens', 0),
-                        'output_tokens': last_usage.get('output_tokens', 0),
-                        'cache_read': last_usage.get('cached_input_tokens', 0),
-                        'cache_write': 0,
-                        'total_tokens': last_usage.get('total_tokens', 0),
-                    },
+                    normalized_usage,
+                    ingest_source=(
+                        "codex_app_server"
+                        if codex_app_server_root_for(filepath)
+                        else "codex_cli"
+                    ),
                 )
 
                 if current_model_raw is not None and model_raw != current_model_raw:
                     flush_segment()
                 current_model_raw = model_raw
+                msg_cost = maybe_calculate_cli_cost(model_raw, normalized_usage, None)
                 segment_msgs.append({
                     'timestamp': timestamp,
                     'model_raw': model_raw,
-                    'input_tokens': last_usage.get('input_tokens', 0),
-                    'output_tokens': last_usage.get('output_tokens', 0),
-                    'cache_read': last_usage.get('cached_input_tokens', 0),
-                    'cache_write': 0,
-                    'total_tokens': last_usage.get('total_tokens', 0),
+                    **normalized_usage,
+                    'cost_input': msg_cost.get('input', 0),
+                    'cost_output': msg_cost.get('output', 0),
+                    'cost_cache_read': msg_cost.get('cacheRead', 0),
+                    'cost_cache_write': msg_cost.get('cacheWrite', 0),
+                    'cost_total': msg_cost.get('total', 0),
                 })
                 message_count += 1
 
@@ -1367,18 +3218,11 @@ def parse_codex_session_file(filepath, conn, logical_filename: str):
                 (session_id, session_nickname, source_label, filename, created_at, "gui", "codex_cli"),
             )
             return True, message_count, session_id
-    except Exception as exc:
-        print(f"  Error reading {filename}: {exc}")
+    except Exception as e:
+        print(f"  Error reading {filename}: {e}")
         return False, 0, None
 
     return False, 0, None
-
-
-def parse_session_file(filepath, conn, source):
-    logical_filename = make_file_locator(source, filepath)
-    if source["name"] == "codex_cli":
-        return parse_codex_session_file(filepath, conn, logical_filename)
-    return parse_openclaw_session_file(filepath, conn, logical_filename)
 
 
 def migrate_full(conn):
@@ -1392,37 +3236,57 @@ def migrate_full(conn):
     populate_reference_tables(conn)
     migrate_compact_schema(conn)
 
-    sources = [source for source in get_log_sources() if source["root"].exists()]
-    if not sources:
-        print("ERROR: No session log directories found.")
-        return
-
-    source_files = []
-    for source in sources:
-        files, summary = list_source_files(source)
-        print(f"\nFound {summary}")
-        source_files.extend((source, filepath) for filepath in files)
+    # Parse all OpenClaw session files (including deleted/reset) from all configured agents
+    openclaw_files = []
+    for source in OPENCLAW_SESSION_SOURCES:
+        files = collect_openclaw_session_files(source)
+        print(f"\nFound {len(files)} {source['label']} session files")
+        openclaw_files.extend((source, filepath) for filepath in files)
+    codex_files = collect_codex_session_files()
+    print(f"Found {len(codex_files)} {CODEX_SESSION_SOURCE['label']} session files")
+    kimi_files = collect_kimi_session_files()
+    print(f"Found {len(kimi_files)} {KIMI_SESSION_SOURCE['label']} session files")
+    all_files = (
+        openclaw_files
+        + [(CODEX_SESSION_SOURCE, filepath) for filepath in codex_files]
+        + [(KIMI_SESSION_SOURCE, filepath) for filepath in kimi_files]
+    )
 
     success_count = 0
     total_messages = 0
 
     cur = conn.cursor()
-    for i, (source, filepath) in enumerate(source_files):
+    for i, (source, filepath) in enumerate(all_files):
         if (i + 1) % 100 == 0:
-            print(f"  Processing {i+1}/{len(source_files)}...")
+            print(f"  Processing {i+1}/{len(all_files)}...")
             conn.commit()
 
-        success, msg_count, session_id = parse_session_file(filepath, conn, source)
+        success, msg_count, session_id = parse_session_file(filepath, conn, source["key"])
         if success:
             success_count += 1
             total_messages += msg_count
             # Update ingest_state so incremental runs don't re-parse these files
             st = filepath.stat()
-            locator = make_file_locator(source, filepath)
-            update_ingest_state(cur, locator, session_id, st.st_size, st.st_size, st.st_mtime)
+            storage_name = get_session_storage_name(filepath, source["key"])
+            update_ingest_state(cur, storage_name, session_id, st.st_size, st.st_size, st.st_mtime)
+
+    claude_files = collect_claude_session_files()
+    print(f"Found {len(claude_files)} Claude session files")
+    for i, filepath in enumerate(claude_files):
+        if (i + 1) % 100 == 0:
+            print(f"  Processing Claude {i+1}/{len(claude_files)}...")
+            conn.commit()
+
+        success, msg_count, session_id = parse_claude_session_file(filepath, conn)
+        if success:
+            st = filepath.stat()
+            storage_name = get_session_storage_name(filepath, "claude")
+            update_ingest_state(cur, storage_name, session_id, st.st_size, st.st_size, st.st_mtime)
+            success_count += 1
+            total_messages += msg_count
 
     conn.commit()
-    print(f"\n✓ Migrated {success_count}/{len(source_files)} sessions")
+    print(f"\n✓ Migrated {success_count}/{len(all_files) + len(claude_files)} sessions")
     print(f"✓ Total messages: {total_messages}")
 
     # Print summary stats
@@ -1456,7 +3320,7 @@ def get_file_last_timestamp(filepath):
     return None
 
 
-def migrate_incremental(conn):
+def migrate_incremental(conn, include_openclaw=True, include_claude=True):
     """Incremental migration (append-only).
 
     The SQLite DB is the long-term archive.
@@ -1479,20 +3343,23 @@ def migrate_incremental(conn):
     ensure_pragmas(conn)
     migrate_compact_schema(conn)
 
-    sources = [source for source in get_log_sources() if source["root"].exists()]
-    if not sources:
-        print("ERROR: No session log directories found.")
-        return
+    total_processed_msgs = 0
+    processed_files = 0
+    touched_session_ids = set()
 
-    to_process = []  # (source, filepath, start_offset)
+    if include_openclaw:
+        openclaw_files = []
+        for source in OPENCLAW_SESSION_SOURCES:
+            openclaw_files.extend((source, filepath) for filepath in collect_openclaw_session_files(source))
+        openclaw_files.extend((CODEX_SESSION_SOURCE, filepath) for filepath in collect_codex_session_files())
+        openclaw_files.extend((KIMI_SESSION_SOURCE, filepath) for filepath in collect_kimi_session_files())
 
-    for source in sources:
-        files, summary = list_source_files(source)
-        print(f"Found {summary}")
-        for filepath in files:
-            locator = make_file_locator(source, filepath)
+        to_process = []  # (source, filepath, start_offset)
+
+        for source, filepath in openclaw_files:
+            storage_name = get_session_storage_name(filepath, source["key"])
             st = filepath.stat()
-            state = get_ingest_state(cur, locator)
+            state = get_ingest_state(cur, storage_name)
 
             if not state:
                 to_process.append((source, filepath, 0))
@@ -1501,128 +3368,192 @@ def migrate_incremental(conn):
             last_offset = int(state.get('last_offset') or 0)
             last_mtime = state.get('last_mtime')
 
-            # File got smaller -> truncated/rewritten; re-ingest from start (upsert is safe)
             if st.st_size < last_offset:
                 to_process.append((source, filepath, 0))
                 continue
-
-            # Normal append-only path
             if st.st_size > last_offset:
                 to_process.append((source, filepath, last_offset))
                 continue
-
-            # If size is unchanged but mtime jumped, be conservative: re-scan from start
             if last_mtime is not None and st.st_mtime > float(last_mtime) and st.st_size == last_offset:
                 to_process.append((source, filepath, 0))
 
-    print(f"Found {len(to_process)} session files needing ingest")
-    if not to_process:
-        print("✓ Database is up to date")
-        return
+        print(f"Found {len(to_process)} OpenClaw/Codex/Kimi session files needing ingest")
 
-    total_processed_msgs = 0
-    processed_files = 0
+        for source, filepath, start_offset in to_process:
+            filename = os.path.basename(filepath)
+            storage_name = get_session_storage_name(filepath, source["key"])
+            st = filepath.stat()
+            state = get_ingest_state(cur, storage_name)
+            known_session_id = state.get('session_id') if state else None
 
-    for source, filepath, start_offset in to_process:
-        locator = make_file_locator(source, filepath)
-        st = filepath.stat()
-
-        # We need a session_id to attach messages when ingesting from an offset.
-        state = get_ingest_state(cur, locator)
-        known_session_id = state.get('session_id') if state else None
-
-        # If we don't know session_id, or we're re-ingesting from 0, parse full file.
-        if start_offset == 0 or not known_session_id:
-            success, msg_count, session_id = parse_session_file(filepath, conn, source)
-            if not success or not session_id:
+            if start_offset == 0 or not known_session_id:
+                success, msg_count, session_id = parse_session_file(filepath, conn, source["key"])
+                if not success or not session_id:
+                    continue
+                recompute_segments(conn, session_id)
+                update_ingest_state(cur, storage_name, session_id, st.st_size, st.st_size, st.st_mtime)
+                processed_files += 1
+                total_processed_msgs += msg_count
+                touched_session_ids.add(session_id)
                 continue
 
-            # segments in parse_session_file are based only on this pass; recompute from DB to be safe
-            recompute_segments(conn, session_id)
+            processed = ingest_messages_from_offset(filepath, conn, start_offset, known_session_id, source["key"])
+            recompute_segments(conn, known_session_id)
+            touched_session_ids.add(known_session_id)
+            update_ingest_state(cur, storage_name, known_session_id, st.st_size, st.st_size, st.st_mtime)
+            processed_files += 1
+            total_processed_msgs += processed
 
-            update_ingest_state(cur, locator, session_id, st.st_size, st.st_size, st.st_mtime)
+            is_deleted, deleted_ts = detect_deleted(filename)
+            if is_deleted:
+                cur.execute("UPDATE sessions SET deleted_at = COALESCE(deleted_at, ?) WHERE session_id = ?", (deleted_ts, known_session_id))
+
+    if include_claude:
+        claude_files = collect_claude_session_files()
+        claude_to_process = []
+        for filepath in claude_files:
+            storage_name = get_session_storage_name(filepath, "claude")
+            st = filepath.stat()
+            state = get_ingest_state(cur, storage_name)
+            if not state:
+                claude_to_process.append(filepath)
+                continue
+            last_offset = int(state.get("last_offset") or 0)
+            last_mtime = state.get("last_mtime")
+            if st.st_size != last_offset:
+                claude_to_process.append(filepath)
+                continue
+            if last_mtime is not None and st.st_mtime > float(last_mtime):
+                claude_to_process.append(filepath)
+
+        print(f"Found {len(claude_to_process)} Claude session files needing ingest")
+
+        for filepath in claude_to_process:
+            st = filepath.stat()
+            success, msg_count, session_id = parse_claude_session_file(filepath, conn)
+            if not success or not session_id:
+                continue
+            recompute_segments(conn, session_id)
+            touched_session_ids.add(session_id)
+            storage_name = get_session_storage_name(filepath, "claude")
+            update_ingest_state(cur, storage_name, session_id, st.st_size, st.st_size, st.st_mtime)
             processed_files += 1
             total_processed_msgs += msg_count
-            continue
 
-        # Append-only ingest for existing sessions
-        processed = ingest_messages_from_offset(filepath, conn, start_offset, known_session_id, source)
-        recompute_segments(conn, known_session_id)
-        update_ingest_state(cur, locator, known_session_id, st.st_size, st.st_size, st.st_mtime)
-
-        processed_files += 1
-        total_processed_msgs += processed
-
-        # Also update deleted/reset marker purely from filename (no log dependency)
-        is_deleted, deleted_ts = detect_deleted(os.path.basename(filepath))
-        if is_deleted:
-            cur.execute("UPDATE sessions SET deleted_at = COALESCE(deleted_at, ?) WHERE session_id = ?", (deleted_ts, known_session_id))
+    if processed_files == 0:
+        print("✓ Database is up to date")
+        return touched_session_ids
 
     conn.commit()
     print(f"✓ Processed {processed_files} files")
     print(f"✓ Assistant messages ingested/upserted: {total_processed_msgs}")
+    return touched_session_ids
 
 
 
 def parse_args():
-    ap = argparse.ArgumentParser(description="Ingest OpenClaw and Codex CLI session logs into an AI Cost Tracker SQLite database.")
+    ap = argparse.ArgumentParser(
+        description="Ingest OpenClaw SQLite/JSONL and CLI usage into an AI Cost Tracker database."
+    )
     mode = ap.add_mutually_exclusive_group()
-    mode.add_argument("--full", action="store_true", help="Rebuild the database from scratch.")
-    mode.add_argument("--incremental", action="store_true", help="Append new data into an existing database (default).")
-    ap.add_argument("--db", default=str(DB_PATH), help="SQLite database path (default: %(default)s)")
-    ap.add_argument("--schema", default=str(SCRIPT_DIR / 'schema.sql'), help="Schema SQL path (default: %(default)s)")
-    ap.add_argument("--sessions-dir", default=str(SESSIONS_DIR), help="Directory containing OpenClaw session .jsonl files.")
-    ap.add_argument("--codex-sessions-dir", default=str(CODEX_SESSIONS_DIR), help="Directory containing Codex CLI session logs.")
-    ap.add_argument("--channel-mapping", default=None, help="Optional JSON file mapping channel IDs to names.")
-    ap.add_argument("--backups-dir", default=str(BACKUPS_DIR), help="Directory for rolling SQLite backups.")
+    mode.add_argument("--full", action="store_true", help="Rebuild the database from raw sources.")
+    mode.add_argument("--incremental", action="store_true", help="Append new data (default for an existing DB).")
+    ap.add_argument("--db", default=str(DB_PATH), help="SQLite database path.")
+    ap.add_argument("--sessions-dir", default=str(SESSIONS_DIR), help="Primary OpenClaw JSONL sessions directory.")
+    ap.add_argument("--openclaw-agents-dir", default=str(OPENCLAW_AGENTS_DIR), help="OpenClaw agents root containing per-agent SQLite stores and session directories.")
+    ap.add_argument("--codex-sessions-dir", default=str(CODEX_SESSIONS_DIR), help="Classic Codex CLI sessions directory.")
+    ap.add_argument("--claude-projects-dir", default=str(CLAUDE_PROJECTS_DIR), help="Claude Code projects directory.")
+    ap.add_argument("--kimi-code-dir", default=str(KIMI_CODE_DIR), help="Kimi Code data directory.")
+    ap.add_argument("--channel-mapping", default=None, help="Optional JSON channel-id mapping.")
+    ap.add_argument("--backups-dir", default=str(BACKUPS_DIR), help="Rolling backup directory.")
+    ap.add_argument("--openclaw-sqlite", dest="openclaw_sqlite", action="store_true", default=True, help="Ingest per-agent OpenClaw SQLite stores (default).")
+    ap.add_argument("--no-openclaw-sqlite", dest="openclaw_sqlite", action="store_false", help="Disable OpenClaw SQLite ingestion.")
+    ap.add_argument("--claude-only", action="store_true", help="Only ingest Claude Code sources.")
+    ap.add_argument("--skip-claude", action="store_true", help="Do not ingest Claude Code sources.")
     return ap.parse_args()
 
 
 def main():
-    global DB_PATH, SESSIONS_DIR, CODEX_SESSIONS_DIR, BACKUPS_DIR, CHANNEL_MAPPING_PATH
+    global DB_PATH, SESSIONS_DIR, SESSIONS_INDEX_PATH, OPENCLAW_AGENTS_DIR
+    global OPENCLAW_SESSION_SOURCES, CODEX_SESSIONS_DIR, CODEX_SESSION_SOURCE
+    global CODEX_HOME_GLOB, CLAUDE_PROJECTS_DIR, KIMI_CODE_DIR, KIMI_SESSION_SOURCE
+    global CHANNEL_MAPPING_PATH, BACKUPS_DIR
 
     args = parse_args()
     DB_PATH = Path(args.db).expanduser().resolve()
     SESSIONS_DIR = Path(args.sessions_dir).expanduser().resolve()
+    SESSIONS_INDEX_PATH = SESSIONS_DIR / "sessions.json"
+    OPENCLAW_AGENTS_DIR = Path(args.openclaw_agents_dir).expanduser().resolve()
+    CODEX_HOME_GLOB = OPENCLAW_AGENTS_DIR
     CODEX_SESSIONS_DIR = Path(args.codex_sessions_dir).expanduser().resolve()
-    BACKUPS_DIR = Path(args.backups_dir).expanduser().resolve()
+    CODEX_SESSION_SOURCE = {"key": "codex_cli", "label": "Codex CLI", "dir": CODEX_SESSIONS_DIR}
+    CLAUDE_PROJECTS_DIR = Path(args.claude_projects_dir).expanduser().resolve()
+    KIMI_CODE_DIR = Path(args.kimi_code_dir).expanduser().resolve()
+    KIMI_SESSION_SOURCE = {"key": "kimi_code", "label": "Kimi Code", "dir": KIMI_CODE_DIR}
     CHANNEL_MAPPING_PATH = Path(args.channel_mapping).expanduser().resolve() if args.channel_mapping else None
-
-    # init_db reads schema.sql relative to SCRIPT_DIR, so keep the public package self-contained.
-    schema_path = Path(args.schema).expanduser().resolve()
-    if schema_path != (SCRIPT_DIR / 'schema.sql').resolve():
-        print(f"WARNING: --schema is currently informational only; using packaged schema at {SCRIPT_DIR / 'schema.sql'}")
-
+    BACKUPS_DIR = Path(args.backups_dir).expanduser().resolve()
+    OPENCLAW_SESSION_SOURCES = discover_openclaw_session_sources()
     load_channel_mapping(CHANNEL_MAPPING_PATH)
 
-    print("AI Cost Tracker migration")
-    print(f"Database: {DB_PATH}")
-    print(f"OpenClaw sessions: {SESSIONS_DIR}")
-    print(f"Codex sessions: {CODEX_SESSIONS_DIR}")
-    if CHANNEL_MAPPING_PATH:
-        print(f"Channel mapping: {CHANNEL_MAPPING_PATH}")
+    full_mode = args.full
+    claude_only = args.claude_only
+    skip_claude = args.skip_claude
+    include_openclaw_sqlite = args.openclaw_sqlite
+    include_openclaw = not claude_only
+    include_claude = not skip_claude or claude_only
 
-    if not any(source["root"].exists() for source in get_log_sources()):
-        print("ERROR: No session directories found.")
-        print(f"  OpenClaw: {SESSIONS_DIR}")
-        print(f"  Codex: {CODEX_SESSIONS_DIR}")
+    print(f"AI Cost Tracker Migration")
+    print(f"Database: {DB_PATH}")
+    print("OpenClaw session sources:")
+    for source in OPENCLAW_SESSION_SOURCES:
+        print(f"  {source['key']}: {source['dir']}")
+    print(f"Codex CLI sessions: {CODEX_SESSIONS_DIR}")
+    print(f"Kimi Code sessions: {KIMI_CODE_DIR / 'sessions'}")
+
+    available_sources = (
+        any(source["dir"].exists() for source in OPENCLAW_SESSION_SOURCES)
+        or CODEX_SESSIONS_DIR.exists()
+        or CLAUDE_PROJECTS_DIR.exists()
+        or (KIMI_CODE_DIR / "sessions").exists()
+        or (include_openclaw_sqlite and bool(collect_openclaw_sqlite_sources()))
+    )
+    if not available_sources:
+        print("ERROR: No supported usage sources were found.")
+        print(f"  OpenClaw agents: {OPENCLAW_AGENTS_DIR}")
+        print(f"  Primary sessions: {SESSIONS_DIR}")
+        print(f"  Codex CLI: {CODEX_SESSIONS_DIR}")
         sys.exit(1)
 
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
-
     db_existed = DB_PATH.exists()
+
+    # Rolling backup (best-effort)
     maybe_backup_db(DB_PATH)
 
+    # Connect to database
     conn = sqlite3.connect(DB_PATH)
     init_db(conn)
     ensure_pragmas(conn)
 
     try:
-        if args.full or (not args.incremental and not db_existed):
+        if full_mode or (not args.incremental and not db_existed):
             migrate_full(conn)
+            if include_openclaw_sqlite:
+                ingest_openclaw_sqlite(conn)
+            backfill_message_ingest_sources(conn)
+            normalize_model_reference_aliases(conn)
+            reconcile_usage_duplicates(conn)
+            backfill_cli_payg_costs(conn)
         else:
-            migrate_incremental(conn)
+            touched = migrate_incremental(conn, include_openclaw=include_openclaw, include_claude=include_claude)
+            if include_openclaw_sqlite:
+                touched.update(ingest_openclaw_sqlite(conn))
+            backfill_message_ingest_sources(conn)
+            normalize_model_reference_aliases(conn)
+            reconciled_sessions, _ = reconcile_usage_duplicates(conn)
+            touched.update(reconciled_sessions)
+            backfill_cli_payg_costs(conn, session_ids=touched)
     finally:
         conn.close()
 

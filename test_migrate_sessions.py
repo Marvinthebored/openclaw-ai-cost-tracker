@@ -84,8 +84,12 @@ class CodexImportTests(unittest.TestCase):
                 migrate_sessions.populate_reference_tables(conn)
                 migrate_sessions.migrate_compact_schema(conn)
 
-                source = {"name": "codex_cli", "root": sessions_root}
-                ok, msg_count, session_id = migrate_sessions.parse_session_file(log_path, conn, source)
+                previous_codex_root = migrate_sessions.CODEX_SESSIONS_DIR
+                migrate_sessions.CODEX_SESSIONS_DIR = sessions_root
+                try:
+                    ok, msg_count, session_id = migrate_sessions.parse_codex_session_file(log_path, conn)
+                finally:
+                    migrate_sessions.CODEX_SESSIONS_DIR = previous_codex_root
                 self.assertTrue(ok)
                 self.assertEqual(msg_count, 2)
                 self.assertEqual(session_id, "019dd30d-5ab3-71f2-9a23-2f0658896c77")
@@ -112,8 +116,8 @@ class CodexImportTests(unittest.TestCase):
                 self.assertEqual(
                     message_rows,
                     [
-                        ("codex_cli/gpt-5.4", 12567, 7552, 303, 12870),
-                        ("codex_cli/gpt-5.4-mini", 45719, 41344, 435, 46154),
+                        ("codex_cli/gpt-5.4", 5015, 7552, 303, 12870),
+                        ("codex_cli/gpt-5.4-mini", 4375, 41344, 435, 46154),
                     ],
                 )
 
