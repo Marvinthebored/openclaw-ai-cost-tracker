@@ -77,6 +77,9 @@
             flex-wrap: wrap;
             align-items: center;
         }
+        .controls.config-mode > .control-group:not(.view-nav),
+        .controls.config-mode #refresh-btn,
+        .controls.config-mode #clear-btn { display: none; }
         .control-group {
             display: flex;
             align-items: center;
@@ -372,12 +375,11 @@
 <div class="container">
     <header>
         <h1>🤖 AI Cost Tracker v4</h1>
-        <div class="timestamp">Generated: <span id="generated-time">Loading...</span> · <span class="ref-build-stamp">Build 2026.08.01.1 · OpenClaw SQLite + in-page rate cards</span></div>
+        <div class="timestamp">Generated: <span id="generated-time">Loading...</span> · <span class="ref-build-stamp">Build 2026.08.01.2 · config back navigation</span></div>
         <div id="warning-bar" class="warning-bar"></div>
     </header>
 
-    <div id="view-main">
-    <div class="controls">
+    <div id="main-controls" class="controls">
         <div class="control-group">
             <label>TZ</label>
             <select id="tz-select" onchange="applyTimezone()">
@@ -426,14 +428,15 @@
                 <a class="cfg-item" onclick="setAllPioneerOverrides(false)">✗ Show all raw</a>
             </div>
         </div>
-        <div class="control-group" style="margin-left:auto; display: flex; gap: 8px; align-items: center;">
+        <div class="control-group view-nav" style="margin-left:auto; display: flex; gap: 8px; align-items: center;">
             <button id="refresh-btn" onclick="refreshData()" style="background: #4CAF50; border: none; color: white; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-weight: 500;">⟳ Refresh</button>
-            <button onclick="clearFilters()" style="background: var(--card-bg); border: 1px solid var(--border); color: var(--text); padding: 6px 10px; border-radius: 4px; cursor: pointer;">Clear</button>
-            <button id="config-btn" onclick="toggleConfigView()" style="background: var(--card-bg); border: 1px solid var(--border); color: var(--text); padding: 6px 10px; border-radius: 4px; cursor: pointer;">⚙️ Config</button>
+            <button id="clear-btn" onclick="clearFilters()" style="background: var(--card-bg); border: 1px solid var(--border); color: var(--text); padding: 6px 10px; border-radius: 4px; cursor: pointer;">Clear</button>
+            <button id="config-btn" onclick="toggleConfigView()" style="height: 31.5px; background: var(--card-bg); border: 1px solid var(--border); color: var(--text); padding: 6px 10px; border-radius: 4px; cursor: pointer;">⚙️ Config</button>
             <input type="file" id="tsv-upload-input" accept=".tsv,.txt,.csv" style="display:none;" />
         </div>
     </div>
 
+    <div id="view-main">
     <div class="table-container">
         <table id="sessions-table">
             <thead>
@@ -1897,11 +1900,13 @@ function toggleConfigView(force) {
     buildRefPanels();
     const main = document.getElementById('view-main');
     const cfg = document.getElementById('view-config');
+    const controls = document.getElementById('main-controls');
     const btn = document.getElementById('config-btn');
     const show = (force === undefined) ? cfg.hidden : !!force;
     cfg.hidden = !show;
     main.hidden = show;
-    btn.textContent = show ? '← Data' : '⚙️ Config';
+    controls.classList.toggle('config-mode', show);
+    btn.textContent = show ? 'Back' : '⚙️ Config';
     if (show) {
         for (const t of REF_ORDER) { if (!refState[t]) refLoad(t); }
         window.scrollTo({ top: 0, behavior: 'smooth' });
