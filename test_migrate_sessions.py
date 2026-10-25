@@ -100,8 +100,8 @@ class CodexImportTests(unittest.TestCase):
                 ).fetchone()
                 self.assertEqual(session_row[0], "codex_cli:2026/04/28/rollout-2026-04-28T15-46-01-019dd30d-5ab3-71f2-9a23-2f0658896c77.jsonl")
                 self.assertEqual(session_row[1], "vscode")
-                self.assertEqual(session_row[2], "gui")
-                self.assertEqual(session_row[3], "codex_cli")
+                self.assertEqual(session_row[2], "cli")
+                self.assertEqual(session_row[3], "cli")
 
                 message_rows = conn.execute(
                     """
@@ -116,8 +116,8 @@ class CodexImportTests(unittest.TestCase):
                 self.assertEqual(
                     message_rows,
                     [
-                        ("codex_cli/gpt-5.4", 5015, 7552, 303, 12870),
-                        ("codex_cli/gpt-5.4-mini", 4375, 41344, 435, 46154),
+                        ("cli-codex/gpt-5.4", 5015, 7552, 303, 12870),
+                        ("cli-codex/gpt-5.4-mini", 4375, 41344, 435, 46154),
                     ],
                 )
 
@@ -128,8 +128,8 @@ class CodexImportTests(unittest.TestCase):
                 self.assertEqual(
                     segment_rows,
                     [
-                        ("codex_cli/gpt-5.4", 0, 1),
-                        ("codex_cli/gpt-5.4-mini", 1, 1),
+                        ("cli-codex/gpt-5.4", 0, 1),
+                        ("cli-codex/gpt-5.4-mini", 1, 1),
                     ],
                 )
             finally:

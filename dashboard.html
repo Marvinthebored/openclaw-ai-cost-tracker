@@ -342,7 +342,6 @@
         .ref-cell:hover { border-color: rgba(48,54,61,0.9); }
         .ref-cell:focus { outline: none; border-color: var(--accent); background: rgba(13,17,23,0.7); box-shadow: 0 0 0 2px rgba(88,166,255,0.15); }
         .ref-cell.ref-num { text-align: right; font-variant-numeric: tabular-nums; }
-        .ref-derived { color: var(--text-muted); font-style: italic; user-select: none; white-space: nowrap; }
         .ref-cell--select {
             appearance: none; -webkit-appearance: none; cursor: pointer; padding-right: 16px;
             background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='8' height='5'><path d='M0 0l4 5 4-5z' fill='%238b949e'/></svg>");
@@ -375,7 +374,7 @@
 <div class="container">
     <header>
         <h1>🤖 AI Cost Tracker v4</h1>
-        <div class="timestamp">Generated: <span id="generated-time">Loading...</span> · <span class="ref-build-stamp">Build 2026.08.01.2 · config back navigation</span></div>
+        <div class="timestamp">Generated: <span id="generated-time">Loading...</span> · <span class="ref-build-stamp">Build 2026.10.25 · per-call runtime accounting</span></div>
         <div id="warning-bar" class="warning-bar"></div>
     </header>
 
@@ -478,7 +477,7 @@
                     <th data-sort="hit_rate" class="num" title="Cache hit rate: cache reads / total input tokens">Hit %</th>
                     <th data-sort="cost_io" class="num cost-sub col-cost">I+O</th>
                     <th data-sort="cost_cache" class="num cost-sub col-cost">Cache</th>
-                    <th data-sort="cost_logged" class="num cost-logged col-cost">Total</th>
+                    <th data-sort="cost_logged" class="num cost-logged col-cost" title="Logged PAYG cost; subscription estimate used when logged cost is zero">Total</th>
                     <th class="num col-mtok col-mtok-shade">/MTOK</th>
                 </tr>
             </thead>
@@ -751,14 +750,13 @@ function formatSessionId(id) {
 function getDisplaySource(row) {
     const filename = row?.filename || '';
     const source = row?.session_type || '';
+    if (source === 'cli') return 'CLI';
+    if (source === 'openclaw') return 'OpenClaw';
     if (filename.startsWith('claude:')) {
         if (source && !['gui', 'claude_cli'].includes(source)) {
             return source === 'openclaw' ? 'OpenClaw' : source;
         }
         return 'CLI';
-    }
-    if (filename.startsWith('codex_cli:codex-home/')) {
-        return 'Codex';
     }
     if (filename.startsWith('codex_cli:')) {
         return 'CLI';
@@ -809,35 +807,35 @@ function sessionFilePath(filename) {
     return `~/.openclaw/agents/main/sessions/${filename}`;
 }
 
-function sessionFileHref(filename, sessionId) {
+function sessionFileHref(filename, sessionId, modelRaw, segmentIndex, firstMsgTs, lastMsgTs) {
     const isFileBacked = filename.startsWith('codex_cli:') || filename.startsWith('claude:');
-    if (!isFileBacked && sessionId) {
+    if (sessionId) {
         const display = sessionFilePath(filename);
-        return `/jsonl-viewer?sid=${encodeURIComponent(sessionId)}&display=${encodeURIComponent(display)}`;
+        const qs = new URLSearchParams({
+            sid: sessionId,
+            display,
+            model_raw: modelRaw || '',
+            segment_index: String(segmentIndex ?? ''),
+            start: firstMsgTs || '',
+            end: lastMsgTs || ''
+        });
+        return `/jsonl-viewer?${qs.toString()}`;
     }
     const path = sessionFilePath(filename);
     return path ? `/jsonl-viewer?path=${encodeURIComponent(path)}` : '#';
 }
 
 function getDisplayChannel(row) {
-    const modelRaw = row?.model_raw || '';
-    const filename = row?.filename || '';
-    if (
-        filename.startsWith('claude:') &&
-        !['CLI', 'gui', 'claude_cli'].includes(getDisplaySource(row))
-    ) {
-        return row?.channel_name || row?.parent_nickname || 'OpenClaw';
-    }
-    if (modelRaw.startsWith('codex_cli/')) {
+    const source = getDisplaySource(row);
+    if (source === 'CLI') {
         const label = row?.parent_nickname || '';
         const labels = {
             cli: 'terminal',
-            exec: 'exec',
-            vscode: 'VS Code'
+            exec: 'exec'
         };
-        return labels[label] || label || 'Codex CLI';
+        return labels[label] || label || 'terminal';
     }
-    return row?.parent_nickname || row?.channel_name || '-';
+    return row?.channel_name || row?.parent_nickname || (source === 'OpenClaw' ? 'OpenClaw' : '-');
 }
 
 // Refresh data (incremental migration + reload)
@@ -1314,7 +1312,7 @@ function updateTotals() {
     // Calculate totals
     let totalInput = 0, totalCacheRead = 0, totalCacheWrite = 0, totalIn = 0;
     let totalOutput = 0, totalTokens = 0, totalCostIO = 0, totalCostCache = 0;
-    let totalCost = 0, totalCostEst = 0;
+    let totalCost = 0, totalCostEst = 0, totalCostDisplayed = 0;
     let totalRequests = 0;
 
     filtered.forEach(s => {
@@ -1327,8 +1325,11 @@ function updateTotals() {
         totalTokens += s.total_tokens || 0;
         totalCostIO += s.cost_io || 0;
         totalCostCache += s.cost_cache || 0;
-        totalCost += s.cost_logged || 0;
-        totalCostEst += calculateCostEst(s);
+        const estimate = calculateCostEst(s);
+        const logged = Number(s.cost_logged || 0);
+        totalCost += logged;
+        totalCostEst += estimate;
+        totalCostDisplayed += logged || estimate;
     });
 
     // Update display in table header row
@@ -1343,10 +1344,10 @@ function updateTotals() {
     document.getElementById('total-hit-rate').textContent = formatHitRate(totalCacheRead, totalIn);
     document.getElementById('total-cost-io').textContent = formatCost(totalCostIO);
     document.getElementById('total-cost-cache').textContent = formatCost(totalCostCache);
-    document.getElementById('total-cost').textContent = formatPaygTotal(totalCost);
+    document.getElementById('total-cost').textContent = formatPaygTotal(totalCostDisplayed);
 
     const mtok = totalTokens ? (totalTokens / 1e6) : 0;
-    const costPerMtokLogged = mtok > 0 ? (totalCost / mtok) : null;
+    const costPerMtokLogged = mtok > 0 ? (totalCostDisplayed / mtok) : null;
     document.getElementById('total-cost-mtok-logged').textContent = formatCostPerMtok(costPerMtokLogged);
 }
 
@@ -1680,14 +1681,23 @@ function renderTable() {
             statusIcon = `<span class="trash-icon" title="${t}">🗑️</span>`;
         }
 
-        const fileHref = (!isGrouped && filename) ? sessionFileHref(filename, s.session_id) : '#';
+        const fileHref = (!isGrouped && filename) ? sessionFileHref(
+            filename,
+            s.session_id,
+            s.model_raw,
+            s.segment_index,
+            s.first_msg_ts,
+            s.last_msg_ts
+        ) : '#';
         const rowId = isGrouped ? s.session_id : `${s.session_id}__${s.model_raw}__${s.segment_index}`;
         const isExpanded = (!isGrouped) && expandedSessions.has(rowId);
         const expanderHtml = isGrouped ? '' : `<span class="expander" onclick="toggleDetails(event, '${rowId}')">${isExpanded ? '[-]' : '[+]'}</span>`;
 
         const costEst = isGrouped ? (s.cost_estimated || 0) : calculateCostEst(s);
+        const costLogged = Number(s.cost_logged || 0);
+        const costDisplayed = costLogged || costEst;
         const mtok = (s.total_tokens || 0) / 1e6;
-        const costPerMtokLogged = mtok > 0 ? ((s.cost_logged || 0) / mtok) : null;
+        const costPerMtokLogged = mtok > 0 ? (costDisplayed / mtok) : null;
         const displayChannel = getDisplayChannel(s);
 
         // Session row
@@ -1711,7 +1721,7 @@ function renderTable() {
             <td class="num" style="color: var(--text-muted); font-size: 10px;">${formatHitRate(s.cache_read, s.total_in)}</td>
             <td class="num cost-sub col-cost">${formatCost(s.cost_io)}</td>
             <td class="num cost-sub col-cost">${formatCost(s.cost_cache)}</td>
-            <td class="num cost-logged col-cost">${formatPaygTotal(s.cost_logged)}</td>
+            <td class="num cost-logged col-cost" title="${costLogged ? 'Logged PAYG cost' : (costEst ? 'Subscription allocation estimate' : 'No logged cost or provider estimate')}">${formatPaygTotal(costDisplayed)}</td>
             <td class="num col-mtok col-mtok-shade">${formatCostPerMtok(costPerMtokLogged)}</td>
         </tr>
         `);
@@ -2024,7 +2034,7 @@ const REF_TABLES = {
             { k: 'model_raw', label: 'model_raw', w: '32%' },
             { k: 'endpoint', label: 'Endpoint', w: '88px' },
             { k: 'author', label: 'Author', w: '72px' },
-            { k: 'model', label: 'Model', w: '', ro: true, derived: 'model_raw' },
+            { k: 'model', label: 'Model', w: '' },
             { k: 'pru_multiplier', label: 'PRU', w: '46px', num: true },
         ],
     },
@@ -2095,22 +2105,6 @@ function refSnapshot(table, rows) {
 }
 
 const REF_COL_CAP = { model_raw: 46, notes: 40, provider: 22, endpoint: 16, author: 14, model: 22 };
-function jsCanonical(raw) {
-    if (!raw) return '';
-    let model = raw.includes('/') ? raw.split('/').slice(1).join('/') : raw;
-    model = model.includes('/') ? model.split('/').pop() : model;
-    let lower = model.trim().toLowerCase();
-    if (lower.startsWith('claude-')) lower = lower.slice(7);
-    lower = lower.replace(/^(opus|sonnet|haiku|fable)-(\d+)-(\d+)(.*)$/, '$1-$2.$3$4');
-    if (lower.startsWith('kimi-for-coding')) return lower;
-    const kimi = lower.replace(/^kimi-/, '');
-    if (/(?:^|-)k?2(?:p|[.-])?5(?:-|$)/.test(kimi) || kimi === 'k2p5') return 'k2.5';
-    if (/(?:^|-)k?2(?:p|[.-])?6(?:-|$)/.test(kimi) || kimi === 'k2p6') return 'k2.6';
-    if (/(?:^|-)k?2(?:p|[.-])?7(?:-|$)/.test(kimi) || kimi === 'k2p7') return 'k2.7';
-    if (/(?:^|-)k?3(?:-|$)/.test(kimi)) return 'k3';
-    if (kimi.startsWith('k2')) return 'k2';
-    return lower;
-}
 function refBaseSize(table, col) {
     const cap = REF_COL_CAP[col.k] || (col.num ? 8 : 20);
     const min = col.num ? 5 : 4;
@@ -2251,19 +2245,6 @@ function renderRefTable(table) {
         tr.appendChild(tdDel);
         meta.cols.forEach(col => {
             const td = document.createElement('td');
-            if (col.ro) {
-                const span = document.createElement('span');
-                span.className = 'ref-cell ref-derived';
-                if (col.derived) {
-                    span.dataset.src = col.derived;
-                    span.textContent = jsCanonical(row[col.derived] || '');
-                } else {
-                    span.textContent = (row[col.k] === null || row[col.k] === undefined) ? '' : String(row[col.k]);
-                }
-                td.appendChild(span);
-                tr.appendChild(td);
-                return;
-            }
             let ctl;
             if (col.select) {
                 ctl = document.createElement('select');
@@ -2301,8 +2282,6 @@ function renderRefTable(table) {
                     row[col.k] = refParseValue(col, ctl.value);
                     applySize();
                     refSetDirty(table);
-                    const ds = tr.querySelector(`.ref-derived[data-src="${col.k}"]`);
-                    if (ds) ds.textContent = jsCanonical(ctl.value);
                 });
             }
             td.appendChild(ctl);

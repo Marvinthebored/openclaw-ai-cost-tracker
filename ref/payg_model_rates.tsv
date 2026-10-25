@@ -17,9 +17,10 @@ claude/claude-opus-4-5	5	25	0.5	6.25	Derived from Anthropic/OpenClaw logged PAYG
 claude/claude-opus-4-6	5	25	0.5	6.25	Derived from Anthropic/OpenClaw logged PAYG-equivalent costs
 claude/claude-opus-4-7	5	25	0.5	6.25	Assumed same family pricing as opus 4.x
 claude/claude-opus-4-8	5	25	0.5	6.25	Assumed same family pricing as opus 4.x
-claude/claude-fable-5	10	50	1	12.5	Example override: 2x Opus base (10/50/1/12.5)
+claude/claude-fable-5	10	50	1	12.5	Fable 5 = exactly 2x Opus base per supplied reference 2026-06-11 (10/50/1/12.5)
 claude/claude-sonnet-4-5	3	15	0.3	3.75	Assumed same family pricing as sonnet 4.x
 claude/claude-sonnet-4-6	3	15	0.3	3.75	Derived from Anthropic/OpenClaw logged PAYG-equivalent costs
+claude/claude-sonnet-5	3	15	0.3	3.75	Same token pricing as the Sonnet family
 pioneer/claude-opus-4-6	5	25	0.5	6.25	Pioneer = Anthropic opus base. Aligned 2026-06-06 to match experimentally-verified 4-8 base pricing (prior +10% 5.5/27.5/0.55 retired).
 pioneer/claude-opus-4-7	5	25	0.5	6.25	Pioneer = Anthropic opus base. Aligned 2026-06-06 to match experimentally-verified 4-8 base pricing (prior +10% 5.5/27.5/0.55 retired).
 pioneer/claude-opus-4-8	5	25	0.5	6.25	Pioneer Opus 4.8 = Anthropic base (controlled experiment 2026-06-06, 15-row fit, residual <$5e-5). Output was 20 on 2026-06-02; Pioneer raised it to 25 since.
@@ -27,10 +28,21 @@ pioneer/claude-sonnet-4-6	3	15	0.3	3.75	Pioneer = Anthropic base (controlled exp
 pioneer/claude-haiku-4-5	1	5	0.1	1.25	Pioneer = Anthropic base (controlled experiment 2026-06-06, 5-row fit, residual <$4e-5)
 codex_cli/gpt-5.6-sol	5	30	0.5	6.25	Official short-context rates (developers.openai.com/api/docs/pricing, 2026-07-24)
 codex_cli/gpt-5.6-terra	2.5	15	0.25	3.125	Official short-context rates (developers.openai.com/api/docs/pricing, 2026-07-24)
-codex_cli/gpt-5.6-luna	1	6	0.1	1.25	Official short-context rates (developers.openai.com/api/docs/pricing, 2026-07-24)
-codex_cli/gpt-5.3-codex-spark	1.75	14	0.175	0	Official spark rates captured 2026-07-24 (ctx 128k, max out 32k)
+codex_cli/gpt-5.6-luna	0.2	1.2	0.02	0.25	Official rates supplied in reference 2026-09-22 (supersedes 2026-07-24 card)
+codex_cli/gpt-5.3-codex-spark	1.75	14	0.175	0	Official spark rates per supplied reference 2026-07-24 (ctx 128k, max out 32k)
 openai/gpt-5.6-sol	5	30	0.5	6.25	Official short-context rates (developers.openai.com/api/docs/pricing, 2026-07-24)
 openai/gpt-5.6-terra	2.5	15	0.25	3.125	Official short-context rates (developers.openai.com/api/docs/pricing, 2026-07-24)
-openai/gpt-5.6-luna	1	6	0.1	1.25	Official short-context rates (developers.openai.com/api/docs/pricing, 2026-07-24)
-openai/gpt-5.3-codex-spark	1.75	14	0.175	0	Official spark rates captured 2026-07-24 (ctx 128k, max out 32k)
+openai/gpt-5.6-luna	0.2	1.2	0.02	0.25	Official rates supplied in reference 2026-09-22 (supersedes 2026-07-24 card)
+openai/gpt-5.3-codex-spark	1.75	14	0.175	0	Official spark rates per supplied reference 2026-07-24 (ctx 128k, max out 32k)
 kimi-code/k3-256k	3	15	0.3	0	Kimi K3 API rate, cache hit 10% of input; CLI logs no cache creation charge currently (web-verified 2026-07-27)
+claude/claude-opus-5	5	25	0.5	6.25
+zai/glm-5.3	1.4	4.4	0.26	1.4
+zai/glm-5-turbo	1.2	4	0.24	1.2
+zai/glm-5v-turbo	1.2	4	0.24	1.2
+claude/claude-fable-5-1	10	50	0.25	12.5
+openai/gpt-6-astra	10	50	1	12.5
+openai/gpt-6-sol	2	10	0.2	2.5	Official standard short-context rates (developers.openai.com/api/docs/pricing, 2026-09-23)
+openai/gpt-6-luna	0.1	0.5	0.01	0.125	Official standard short-context rates (developers.openai.com/api/docs/pricing, 2026-09-23)
+claude/claude-opus-5-5	4	20	0.2	5	Official rates, 5m cache write; cache read 0.05x input (platform.claude.com pricing, 2026-09-23)
+openai/gpt-6.1-sol	2	10	0.1	2.5	Official standard short-context rates (developers.openai.com/api/docs/pricing, 2026-09-30)
+claude/claude-sonnet-5-5	2	10	0.1	2.5	Official current PAYG-equivalent rates; 5m cache write; cache read 0.05x input. https://platform.claude.com/docs/en/about-claude/pricing verified 2026-10-14. Historical backfill uses current ratecard, not invoice reconstruction.

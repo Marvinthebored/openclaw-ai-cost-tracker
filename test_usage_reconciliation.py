@@ -1,6 +1,7 @@
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 import migrate_sessions as migrator
@@ -8,6 +9,12 @@ import migrate_sessions as migrator
 
 class UsageReconciliationTests(unittest.TestCase):
     def setUp(self):
+        # Synthetic tests never discover the developer's live OpenClaw stores.
+        for name, value in [('collect_openclaw_sqlite_sources', []),
+                            ('collect_scheduled_owner_keys', {})]:
+            mock = patch.object(migrator, name, return_value=value)
+            mock.start()
+            self.addCleanup(mock.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.db_path = Path(self.tmp.name) / "tracker.db"
         self.conn = sqlite3.connect(self.db_path)
@@ -83,7 +90,7 @@ class UsageReconciliationTests(unittest.TestCase):
             message_id="codex-duplicate",
             session_id="codex",
             timestamp="2026-07-10T09:59:59.500Z",
-            model_raw="codex_cli/gpt-5.6-sol",
+            model_raw="openai/gpt-5.6-sol",
             source="codex_app_server",
             input_tokens=100,
             output_tokens=20,
@@ -95,7 +102,7 @@ class UsageReconciliationTests(unittest.TestCase):
             message_id="codex-token-mismatch",
             session_id="codex",
             timestamp="2026-07-10T09:59:59.600Z",
-            model_raw="codex_cli/gpt-5.6-sol",
+            model_raw="openai/gpt-5.6-sol",
             source="codex_app_server",
             input_tokens=101,
             output_tokens=20,
@@ -108,7 +115,7 @@ class UsageReconciliationTests(unittest.TestCase):
             message_id="claude-cli-call",
             session_id="claude",
             timestamp="2026-07-11T10:00:00.000Z",
-            model_raw="claude/claude-opus-5",
+            model_raw="cli-claude/claude-opus-5",
             source="claude_cli",
             input_tokens=2,
             output_tokens=500,
@@ -120,7 +127,7 @@ class UsageReconciliationTests(unittest.TestCase):
             message_id="claude-wrapper",
             session_id="oc",
             timestamp="2026-07-11T10:00:01.200Z",
-            model_raw="claude-cli/claude-opus-5",
+            model_raw="anthropic/claude-opus-5",
             source="openclaw_sqlite:main",
             input_tokens=2,
             output_tokens=3,
@@ -132,7 +139,7 @@ class UsageReconciliationTests(unittest.TestCase):
             message_id="claude-unmatched",
             session_id="oc",
             timestamp="2026-07-12T10:00:00.000Z",
-            model_raw="claude-cli/claude-opus-5",
+            model_raw="anthropic/claude-opus-5",
             source="openclaw_sqlite:main",
             input_tokens=2,
             output_tokens=4,
@@ -146,7 +153,7 @@ class UsageReconciliationTests(unittest.TestCase):
 
         self.assertEqual(summary["duplicate_codex_app_server_openclaw"]["calls"], 1)
         self.assertEqual(summary["duplicate_claude_wrapper_cli"]["calls"], 1)
-        self.assertEqual(touched, {"codex", "oc"})
+        self.assertEqual(touched, {"codex", "claude", "oc"})
         rows = {
             row[0]: row[1:]
             for row in self.conn.execute(
@@ -171,7 +178,170 @@ class UsageReconciliationTests(unittest.TestCase):
         claude_source = self.conn.execute(
             "SELECT session_type FROM sessions WHERE session_id = 'claude'"
         ).fetchone()[0]
-        self.assertEqual(claude_source, "openclaw")
+        self.assertEqual(claude_source, "cli")
+
+        attributions = self.conn.execute(
+            """
+            SELECT source_message_id, canonical_session_id, mr.model_raw, reason
+            FROM message_attributions a
+            JOIN model_reference mr ON mr.id = a.canonical_model_ref_id
+            ORDER BY source_message_id
+            """
+        ).fetchall()
+        self.assertEqual(attributions, [
+            ("claude-cli-call", "oc", "anthropic/claude-opus-5", "openclaw_claude_runtime_usage"),
+            ("codex-token-mismatch", "oc", "openai/gpt-5.6-sol", "openclaw_codex_runtime_usage"),
+        ])
+        effective = self.conn.execute(
+            """
+            SELECT seg.model_raw, seg.msg_count, seg.total_tokens
+            FROM segments seg
+            WHERE seg.session_id = 'oc'
+            ORDER BY seg.segment_index
+            """
+        ).fetchall()
+        self.assertEqual(effective, [
+            ("openai/gpt-5.6-sol", 2, 841),
+            ("anthropic/claude-opus-5", 2, 164_387),
+        ])
+
+    def test_routed_codex_thread_uses_per_call_rollout_rows(self):
+        """A thread joined by idempotency key is accounted per rollout call.
+
+        Both OpenClaw turn rows are exact sums of their calls (as the current
+        app-server reports them); a turn row is superseded only while at least
+        one attributed call falls in its window.
+        """
+        thread = "01a0aaaa-0000-7000-8000-000000000001"
+        self.add_session("oc", "openclaw_sqlite:main:test.db")
+        self.add_session(thread, "codex_cli:codex-home/main/rollout.jsonl")
+        # Turn 1: two calls, turn row = sum. Turn 2: one call, an exact twin.
+        calls = [
+            ("call-1a", "2026-07-10T10:00:01.000Z", 900, 10, 0),
+            ("call-1b", "2026-07-10T10:00:05.000Z", 20, 30, 896),
+            ("call-2a", "2026-07-10T10:01:00.000Z", 40, 50, 1024),
+        ]
+        for message_id, timestamp, input_tokens, output_tokens, cache_read in calls:
+            self.add_message(
+                message_id=message_id,
+                session_id=thread,
+                timestamp=timestamp,
+                model_raw="openai/gpt-6-astra",
+                source="codex_app_server",
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cache_read=cache_read,
+                cache_write=0,
+                total_tokens=input_tokens + output_tokens + cache_read,
+            )
+        turns = [
+            ("oc-turn-1", "2026-07-10T10:00:05.100Z", 920, 40, 896),
+            ("oc-turn-2", "2026-07-10T10:01:00.100Z", 40, 50, 1024),
+            ("oc-turn-3", "2026-07-10T10:02:00.100Z", 7, 8, 9),  # rollout not ingested yet
+        ]
+        for message_id, timestamp, input_tokens, output_tokens, cache_read in turns:
+            self.add_message(
+                message_id=message_id,
+                session_id="oc",
+                timestamp=timestamp,
+                model_raw="openai/gpt-6-astra",
+                source="openclaw_sqlite:main",
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cache_read=cache_read,
+                cache_write=0,
+                total_tokens=input_tokens + output_tokens + cache_read,
+            )
+        self.conn.commit()
+        routes = {
+            thread: {
+                "session_id": "oc",
+                "model_pairs": {("openai", "gpt-6-astra")},
+                "message_ids": {"oc-turn-1", "oc-turn-2", "oc-turn-3"},
+            }
+        }
+        original = migrator.collect_openclaw_codex_thread_routes
+        migrator.collect_openclaw_codex_thread_routes = lambda include_unrouted=False: routes
+        try:
+            for attempt in range(2):  # idempotent
+                touched, summary = migrator.reconcile_usage_duplicates(self.conn)
+                if attempt == 0:
+                    self.assertIn("oc", touched)
+                else:
+                    self.assertEqual(touched, set())
+                self.assertEqual(
+                    summary[migrator.SUPERSEDED_BY_CODEX_RUNTIME_REASON]["calls"], 2
+                )
+                # The exact twin (call-2a / oc-turn-2) must NOT be excluded in a routed thread.
+                self.assertEqual(summary["duplicate_codex_app_server_openclaw"]["calls"], 0)
+                rows = {
+                    row[0]: row[1:]
+                    for row in self.conn.execute(
+                        "SELECT id, is_excluded, excluded_reason FROM messages"
+                    )
+                }
+                self.assertEqual(rows["oc-turn-1"], (1, migrator.SUPERSEDED_BY_CODEX_RUNTIME_REASON))
+                self.assertEqual(rows["oc-turn-2"], (1, migrator.SUPERSEDED_BY_CODEX_RUNTIME_REASON))
+                self.assertEqual(rows["oc-turn-3"], (0, None))
+                for message_id, *_ in calls:
+                    self.assertEqual(rows[message_id], (0, None))
+                attributed = self.conn.execute(
+                    """
+                    SELECT source_message_id FROM message_attributions
+                    WHERE canonical_session_id = 'oc' AND reason = 'openclaw_codex_runtime_usage'
+                    ORDER BY source_message_id
+                    """
+                ).fetchall()
+                self.assertEqual([r[0] for r in attributed], ["call-1a", "call-1b", "call-2a"])
+                effective = self.conn.execute(
+                    """
+                    SELECT model_raw, msg_count, input_tokens, output_tokens, cache_read, total_tokens
+                    FROM segments WHERE session_id = 'oc'
+                    """
+                ).fetchall()
+                # 3 calls + the uncovered turn-3 row; no double counting of turns 1 and 2.
+                self.assertEqual(
+                    effective,
+                    [("openai/gpt-6-astra", 4, 967, 98, 1929, 2994)],
+                )
+        finally:
+            migrator.collect_openclaw_codex_thread_routes = original
+
+
+    def test_deleted_session_archive_still_routes_its_codex_thread(self):
+        """Cron / cleanup=delete sessions leave only an archive; the route must survive."""
+        import json
+        from compression import zstd
+
+        thread = "01a0bbbb-0000-7000-8000-000000000002"
+        agent_db = Path(self.tmp.name) / "openclaw-agent.sqlite"
+        src = sqlite3.connect(agent_db)
+        src.execute("CREATE TABLE transcript_events (session_id TEXT, seq INTEGER, event_json TEXT)")
+        src.execute(
+            "CREATE TABLE session_transcript_archives "
+            "(session_id TEXT, encoding TEXT, archive_blob BLOB)"
+        )
+        lines = [
+            {"type": "session", "id": "cron-sess"},
+            {"type": "message", "id": "turn-row", "message": {
+                "role": "assistant", "provider": "openai", "model": "gpt-5.6-sol",
+                "idempotencyKey": f"codex-app-server:{thread}:turn1:assistant:0"}},
+        ]
+        blob = zstd.compress("\n".join(json.dumps(l) for l in lines).encode())
+        src.execute("INSERT INTO session_transcript_archives VALUES ('cron-sess', 'zstd', ?)", (blob,))
+        src.commit()
+        src.close()
+
+        saved = (migrator.collect_openclaw_sqlite_sources, migrator.OPENCLAW_SESSION_SOURCES)
+        migrator.collect_openclaw_sqlite_sources = lambda: [{"path": str(agent_db), "agent": "main"}]
+        migrator.OPENCLAW_SESSION_SOURCES = []
+        try:
+            routes = migrator.collect_openclaw_codex_thread_routes()
+        finally:
+            migrator.collect_openclaw_sqlite_sources, migrator.OPENCLAW_SESSION_SOURCES = saved
+        self.assertIn(thread, routes)
+        self.assertEqual(routes[thread]["session_id"], "cron-sess")
+        self.assertEqual(routes[thread]["message_ids"], {"turn-row"})
 
     def test_recomputed_segments_exclude_flagged_rows(self):
         self.add_session("s1", "openclaw_sqlite:main:test.db")
@@ -224,8 +394,8 @@ class UsageReconciliationTests(unittest.TestCase):
         self.add_session("codex", "codex_cli:codex-home/main/rollout.jsonl")
         for message_id, source, model_raw, timestamp in (
             ("oc-one", "openclaw_sqlite:main", "openai/gpt-5.6-sol", "2026-07-20T10:00:00.000Z"),
-            ("codex-nearest", "codex_app_server", "codex_cli/gpt-5.6-sol", "2026-07-20T10:00:00.200Z"),
-            ("codex-second", "codex_app_server", "codex_cli/gpt-5.6-sol", "2026-07-20T10:00:00.300Z"),
+            ("codex-nearest", "codex_app_server", "openai/gpt-5.6-sol", "2026-07-20T10:00:00.200Z"),
+            ("codex-second", "codex_app_server", "openai/gpt-5.6-sol", "2026-07-20T10:00:00.300Z"),
         ):
             self.add_message(
                 message_id=message_id,
@@ -258,7 +428,7 @@ class UsageReconciliationTests(unittest.TestCase):
         ).fetchall()
         self.assertEqual(excluded, [("codex-nearest", "oc-one")])
 
-    def test_model_display_aliases_are_provider_free_and_stable(self):
+    def test_new_model_display_best_guesses_are_provider_free(self):
         expected = {
             "anthropic/claude-opus-4-8": "opus-4.8",
             "openlimits/anthropic/claude-opus-4.8": "opus-4.8",
@@ -275,9 +445,29 @@ class UsageReconciliationTests(unittest.TestCase):
         for model_raw, display in expected.items():
             with self.subTest(model_raw=model_raw):
                 self.assertEqual(
-                    migrator.canonical_model_display_name(model_raw),
+                    migrator.best_guess_model_display_name(model_raw),
                     display,
                 )
+
+    def test_existing_model_reference_aliases_survive_ingest(self):
+        model_raw = "anthropic/claude-opus-4-8"
+        self.conn.execute(
+            """
+            INSERT INTO model_reference
+                (model_raw, endpoint, author, model, pru_multiplier)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (model_raw, "my-endpoint", "My Author", "Claude Big Boy", 7.5),
+        )
+        migrator.ensure_model_reference(self.conn.cursor(), model_raw)
+        row = self.conn.execute(
+            """
+            SELECT endpoint, author, model, pru_multiplier
+            FROM model_reference WHERE model_raw = ?
+            """,
+            (model_raw,),
+        ).fetchone()
+        self.assertEqual(tuple(row), ("my-endpoint", "My Author", "Claude Big Boy", 7.5))
 
 
 if __name__ == "__main__":

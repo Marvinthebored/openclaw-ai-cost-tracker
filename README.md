@@ -3,6 +3,75 @@
 Standalone v4 cost tracker for OpenClaw's current per-agent SQLite stores, legacy
 session JSONL, and supported CLI transcripts.
 
+## Modern OpenClaw compatibility — 2026-10-25
+
+This release includes the current standalone v4 importer, dashboard, and log viewer.
+It supports these storage formats:
+
+- Per-agent SQLite stores, including Zstandard-compressed events.
+- Retained SQLite transcript archives for deleted sessions.
+- Legacy OpenClaw JSONL sessions.
+- Codex app-server rollouts, Claude Code transcripts, and Kimi Code transcripts.
+
+The tracker counts runtime calls under their proven OpenClaw owner.
+Whole-turn totals do not count again when runtime records prove the same usage.
+Ambiguous or incomplete matches retain the wrapper total as a fallback.
+Direct terminal sessions remain separate from OpenClaw-owned work.
+
+The log viewer opens the newest associated runtime log by default.
+Older runtime logs and the original OpenClaw transcript remain selectable.
+Source databases and transcripts remain unchanged.
+
+For compressed archives, use Python 3.14 or later.
+The schema checks use synthetic fixtures, not a promise of compatibility with every future OpenClaw build.
+No Gateway plugin, API key, or OpenClaw configuration change is required.
+The tracker reads usage stores locally. The optional OpenClaw CLI supplies scheduled-job ownership metadata.
+
+### Update an existing installation
+
+Stop the tracker server before you update its code.
+Back up your tracker database and edited files in `ref/`.
+Then run:
+
+```bash
+git pull --ff-only
+python3 migrate_sessions.py --incremental
+python3 server.py
+```
+
+Use the same source-path flags as your original installation.
+An incremental import updates the schema and recomputes duplicate exclusions.
+It preserves your reference-table edits and raw usage records.
+A full rebuild is not required.
+
+### Custom runtime roots
+
+Both the importer and server accept these flags:
+
+```text
+--openclaw-agents-dir /path/to/openclaw/agents
+--sessions-dir /path/to/openclaw/agents/main/sessions
+--codex-sessions-dir /path/to/codex/sessions
+--claude-projects-dir /path/to/claude/projects
+--kimi-code-dir /path/to/kimi-code
+```
+
+Pass the same flags to both commands.
+The server passes these paths to the importer when you select **Refresh**.
+The default server address is loopback-only. The dashboard has no authentication.
+Do not expose it directly to an untrusted network.
+
+### Verification
+
+Run the synthetic regression suite:
+
+```bash
+python3 -m unittest discover -v
+```
+
+Tests cover SQLite ingestion, compressed events, archived transcripts, owner attribution,
+whole-turn deduplication, repeated refreshes, API totals, and runtime-log selection.
+
 ## What it does
 
 - incrementally ingests `~/.openclaw/agents/*/agent/openclaw-agent.sqlite`
@@ -30,11 +99,11 @@ session JSONL, and supported CLI transcripts.
 
 ## Prerequisites
 
-- Python 3.11+ recommended
+- Python 3.14+ (includes Zstandard support for compressed OpenClaw events and archives)
 - OpenClaw data and/or supported CLI transcripts available locally
 - modern browser
 
-No third-party Python packages are required; everything here uses the standard library.
+No third-party Python packages are required. The tracker uses the Python standard library.
 
 ## Quick start
 
@@ -150,8 +219,8 @@ Use this for normal day-to-day refreshes.
 ## Run flow
 
 - `server.py` serves `dashboard.html`
-- the browser calls `/api/cost-v4/sessions` for segment summaries
-- expanded rows call `/api/cost-v4/messages` on demand, so large databases do not eagerly ship every message to the browser
+- the browser calls `/api/cost-v4/sessions` for one summary per owning session and model
+- expanded rows call `/api/cost-v4/messages` on demand for individual model calls
 - the server queries SQLite and returns:
   - session segment rows
   - per-message detail rows when requested
@@ -222,7 +291,7 @@ python3 import_pru_invoice_csv.py \
 
 - The seeded `MODEL_REFERENCE_DATA` and `PROVIDER_COST_DATA` in `migrate_sessions.py` are defaults, not gospel.
 - Unknown models are auto-added to `model_reference` during ingest.
-- Codex CLI sessions are imported with `model_raw` values prefixed `codex_cli/`.
+- Direct CLI sessions use `cli-codex/`, `cli-claude/`, or `cli-kimi/` model prefixes.
 - Channel mapping is optional; without it, the tracker still works.
 - OpenClaw SQLite ingestion is enabled by default; use
   `--no-openclaw-sqlite` only for a deliberate legacy-only run.

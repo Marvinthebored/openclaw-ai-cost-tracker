@@ -1,5 +1,4 @@
--- AI Cost Tracker v3 Schema
--- Default database: ./cost_tracker.db
+-- AI Cost Tracker v4 schema
 
 -- Model reference table (editable)
 CREATE TABLE IF NOT EXISTS model_reference (
@@ -84,6 +83,86 @@ CREATE TABLE IF NOT EXISTS messages (
     is_excluded INTEGER NOT NULL DEFAULT 0
 );
 
+-- Runtime usage can belong to an OpenClaw-owned session even when the complete
+-- counters live in a Claude/Codex transcript. Keep the raw message untouched
+-- and attribute it only in the derived/effective layer.
+CREATE TABLE IF NOT EXISTS message_attributions (
+    source_message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+    canonical_session_id TEXT NOT NULL REFERENCES sessions(session_id),
+    canonical_model_ref_id INTEGER NOT NULL REFERENCES model_reference(id),
+    canonical_message_id TEXT REFERENCES messages(id),
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_message_attributions_session
+    ON message_attributions(canonical_session_id, canonical_model_ref_id);
+
+-- Consumers aggregate this effective identity. The original runtime session,
+-- model and ingest source remain available for audit via source_* columns.
+DROP VIEW IF EXISTS effective_messages;
+CREATE VIEW effective_messages AS
+SELECT
+    m.id,
+    m.session_id,
+    m.parent_id,
+    m.timestamp,
+    m.model_ref_id,
+    m.input_tokens,
+    m.output_tokens,
+    m.cache_read,
+    m.cache_write,
+    m.total_tokens,
+    m.cost_input,
+    m.cost_output,
+    m.cost_cache_read,
+    m.cost_cache_write,
+    m.cost_total,
+    m.cost_source,
+    m.cost_kind,
+    m.cost_is_estimated,
+    m.ingest_source,
+    m.duplicate_of,
+    m.excluded_reason,
+    m.is_excluded,
+    m.session_id AS source_session_id,
+    m.model_ref_id AS source_model_ref_id,
+    NULL AS canonical_message_id,
+    NULL AS attribution_reason
+FROM messages m
+LEFT JOIN message_attributions a ON a.source_message_id = m.id
+WHERE a.source_message_id IS NULL
+UNION ALL
+SELECT
+    m.id,
+    a.canonical_session_id AS session_id,
+    m.parent_id,
+    m.timestamp,
+    a.canonical_model_ref_id AS model_ref_id,
+    m.input_tokens,
+    m.output_tokens,
+    m.cache_read,
+    m.cache_write,
+    m.total_tokens,
+    m.cost_input,
+    m.cost_output,
+    m.cost_cache_read,
+    m.cost_cache_write,
+    m.cost_total,
+    m.cost_source,
+    m.cost_kind,
+    m.cost_is_estimated,
+    m.ingest_source,
+    m.duplicate_of,
+    m.excluded_reason,
+    m.is_excluded,
+    m.session_id AS source_session_id,
+    m.model_ref_id AS source_model_ref_id,
+    a.canonical_message_id,
+    a.reason AS attribution_reason
+FROM message_attributions a
+JOIN messages m ON m.id = a.source_message_id;
+
 -- PAYG spend tracking (manual entry from console)
 CREATE TABLE IF NOT EXISTS payg_spend (
     provider TEXT,
@@ -99,6 +178,8 @@ CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp);
 CREATE INDEX IF NOT EXISTS idx_messages_model_ref ON messages(model_ref_id);
 CREATE INDEX IF NOT EXISTS idx_messages_session_timestamp ON messages(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_messages_session_model_timestamp ON messages(session_id, model_ref_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_messages_source_timestamp ON messages(ingest_source, timestamp);
+CREATE INDEX IF NOT EXISTS idx_messages_session_excluded_reason ON messages(session_id, excluded_reason);
 CREATE INDEX IF NOT EXISTS idx_sessions_channel ON sessions(channel_name);
 CREATE INDEX IF NOT EXISTS idx_sessions_created ON sessions(created_at);
 
@@ -131,6 +212,20 @@ CREATE INDEX IF NOT EXISTS idx_segments_session ON segments(session_id);
 CREATE INDEX IF NOT EXISTS idx_segments_model ON segments(model_raw);
 CREATE INDEX IF NOT EXISTS idx_segments_session_model_idx ON segments(session_id, model_raw, segment_index);
 CREATE INDEX IF NOT EXISTS idx_segments_time_bounds ON segments(first_msg_ts, last_msg_ts);
+
+-- Durable OpenClaw channel session ids survive /new and /reset.  Preserve the
+-- lifecycle events separately so derived segments can split one sticky owner
+-- session into the reset generations the user actually sees.
+CREATE TABLE IF NOT EXISTS session_boundaries (
+    session_id TEXT NOT NULL REFERENCES sessions(session_id),
+    source TEXT NOT NULL,
+    event_seq INTEGER NOT NULL,
+    timestamp TEXT NOT NULL,
+    reason TEXT,
+    PRIMARY KEY (session_id, source, event_seq)
+);
+CREATE INDEX IF NOT EXISTS idx_session_boundaries_session_time
+    ON session_boundaries(session_id, timestamp);
 
 -- Ingestion state (so the DB can be the archive even if old session logs disappear)
 -- Tracks how much of each session file we've ingested, so incremental runs are append-only.

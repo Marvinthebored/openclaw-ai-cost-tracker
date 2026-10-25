@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>OpenClaw JSONL Viewer</title>
+    <title>AI Cost Tracker — Log Viewer</title>
     <link rel="icon" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnIHZpZXdCb3g9JzAgMCAzMiAzMic+PHJlY3Qgd2lkdGg9JzMyJyBoZWlnaHQ9JzMyJyByeD0nNicgZmlsbD0nIzE2MWIyMicvPjxwYXRoIGQ9J003LDQuNSBDNCw0LjUgNC41LDggNC41LDExLjUgQzQuNSwxNC41IDIsMTYgLTcsMTYgQzIsMTYgNC41LDE3LjUgNC41LDIwLjUgQzQuNSwyNCA0LDI3LjUgNywyNy41JyBmaWxsPSdub25lJyBzdHJva2U9JyNjOWQxZDknIHN0cm9rZS13aWR0aD0nMi4yJyBzdHJva2UtbGluZWNhcD0ncm91bmQnIHN0cm9rZS1saW5lam9pbj0ncm91bmQnLz48cGF0aCBkPSdNMjUsNC41IEMyOCw0LjUgMjcuNSw4IDI3LjUsMTEuNSBDMjcuNSwxNC41IDMwLDE2IDM5LDE2IEMzMCwxNiAyNy41LDE3LjUgMjcuNSwyMC41IEMyNy41LDI0IDI4LDI3LjUgMjUsMjcuNScgZmlsbD0nbm9uZScgc3Ryb2tlPScjYzlkMWQ5JyBzdHJva2Utd2lkdGg9JzIuMicgc3Ryb2tlLWxpbmVjYXA9J3JvdW5kJyBzdHJva2UtbGluZWpvaW49J3JvdW5kJy8+PHJlY3QgeD0nNy41JyB5PSc5LjcnIHdpZHRoPScxNScgaGVpZ2h0PScyLjYnIHJ4PScxLjMnIGZpbGw9JyM1OGE2ZmYnLz48cmVjdCB4PSc3LjUnIHk9JzE0LjcnIHdpZHRoPScxNycgaGVpZ2h0PScyLjYnIHJ4PScxLjMnIGZpbGw9JyMzZmI5NTAnLz48cmVjdCB4PSc3LjUnIHk9JzE5LjcnIHdpZHRoPScxMScgaGVpZ2h0PScyLjYnIHJ4PScxLjMnIGZpbGw9JyM4Yjk0OWUnLz48L3N2Zz4=" type="image/svg+xml">
     <style>
         :root {
@@ -53,6 +53,11 @@
             cursor: pointer;
             user-select: none;
         }
+        .wrap-controls {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+        }
         input { accent-color: var(--accent); }
         button.action,
         select {
@@ -74,6 +79,7 @@
             max-width: 42vw;
             min-width: 220px;
         }
+        #source-picker[hidden] { display: none; }
         .hidden-input {
             display: none;
         }
@@ -165,16 +171,18 @@
             font: inherit;
             tab-size: 4;
         }
-        body.wrap .line {
+        body.wrap-expanded .line.is-expanded,
+        body.wrap-unexpanded .line:not(.is-expanded) {
             grid-template-columns: 56px 14px minmax(0, 1fr);
             min-width: 0;
             width: 100%;
         }
-        body.wrap .content {
+        body.wrap-expanded .line.is-expanded .content,
+        body.wrap-unexpanded .line:not(.is-expanded) .content {
             min-width: 0;
         }
-        body.wrap .line-text,
-        body.wrap .json-block {
+        body.wrap-expanded .line.is-expanded .json-block,
+        body.wrap-unexpanded .line:not(.is-expanded) .line-text {
             white-space: pre-wrap;
             overflow-wrap: anywhere;
             overflow-x: visible;
@@ -196,13 +204,24 @@
         .json-null { color: #ffab70; }
         .json-punctuation { color: #d7dde5; }
         .json-line { display: block; }
+        body.wrap-expanded .line.is-expanded .json-line {
+            padding-left: var(--hang, 0ch);
+            text-indent: calc(-1 * var(--hang, 0ch));
+        }
     </style>
 </head>
-<body>
+<body class="wrap-expanded">
     <header>
         <h1>JSONL Viewer</h1>
         <div class="toolbar">
-            <label><input type="checkbox" id="wrap-toggle"> word wrap</label>
+            <label id="source-picker" hidden>source
+                <select id="source-select" title="Primary OpenClaw transcript and attributed runtime usage logs"></select>
+            </label>
+            <div class="wrap-controls" role="group" aria-labelledby="wrap-label" data-ui-protected>
+                <span id="wrap-label">word wrap</span>
+                <label title="Wrap expanded JSONL lines"><input type="checkbox" id="wrap-expanded-toggle" checked> expanded</label>
+                <label title="Wrap unexpanded JSONL lines"><input type="checkbox" id="wrap-unexpanded-toggle"> unexpanded</label>
+            </div>
             <label>tail
                 <select id="line-limit-select" title="Server-loaded logs are tailed so huge Claude files do not crash the tab">
                     <option value="500">500 lines</option>
@@ -236,10 +255,15 @@
         const fileUrl = params.get('url') || '';
         const sid = params.get('sid') || '';
         const displayPath = params.get('display') || '';
+        const modelRaw = params.get('model_raw') || '';
+        const segmentIndex = params.get('segment_index') || '';
+        const segmentStart = params.get('start') || '';
+        const segmentEnd = params.get('end') || '';
         const statusEl = document.getElementById('status');
         const viewerEl = document.getElementById('viewer');
         const dropZone = document.getElementById('drop-zone');
-        const wrapToggle = document.getElementById('wrap-toggle');
+        const wrapExpandedToggle = document.getElementById('wrap-expanded-toggle');
+        const wrapUnexpandedToggle = document.getElementById('wrap-unexpanded-toggle');
         const fileLabel = document.getElementById('file-label');
         const lineLimitSelect = document.getElementById('line-limit-select');
         const prevSliceButton = document.getElementById('prev-slice-button');
@@ -252,10 +276,26 @@
         const localFileInput = document.getElementById('local-file-input');
         const localFolderInput = document.getElementById('local-folder-input');
         const localFileSelect = document.getElementById('local-file-select');
+        const sourcePicker = document.getElementById('source-picker');
+        const sourceSelect = document.getElementById('source-select');
         let localFiles = [];
         let currentSource = null;
         let currentSliceMeta = null;
+        let serverSources = [];
+        let activeServerSource = null;
         const MAX_COLLAPSED_CHARS = 4000;
+
+        if (sid) {
+            activeServerSource = {
+                kind: 'transcript',
+                sid,
+                label: `OpenClaw transcript (${displayPath || sid})`
+            };
+        } else if (fileUrl) {
+            activeServerSource = { kind: 'url', url: fileUrl, label: fileUrl };
+        } else if (filePath) {
+            activeServerSource = { kind: 'path', path: filePath, label: filePath };
+        }
 
         function encodeFilePath(path) {
             return path.split('/').map(part => encodeURIComponent(part)).join('/');
@@ -266,14 +306,62 @@
         }
 
         function serverSourceUrl(startLine = null) {
-            if (sid) return `/api/cost-v4/transcript/${encodeURIComponent(sid)}`;
-            if (fileUrl) return fileUrl;
-            if (filePath) {
-                const qs = new URLSearchParams({ path: filePath, lines: lineLimitSelect.value || '2000' });
+            if (!activeServerSource) return '';
+            if (activeServerSource.kind === 'transcript') {
+                const qs = new URLSearchParams();
+                if (modelRaw) qs.set('model_raw', modelRaw);
+                if (segmentIndex !== '') qs.set('segment_index', segmentIndex);
+                if (segmentStart) qs.set('start', segmentStart);
+                if (segmentEnd) qs.set('end', segmentEnd);
+                const query = qs.toString();
+                return `/api/cost-v4/transcript/${encodeURIComponent(activeServerSource.sid)}${query ? `?${query}` : ''}`;
+            }
+            if (activeServerSource.kind === 'url') return activeServerSource.url;
+            if (activeServerSource.kind === 'path') {
+                const qs = new URLSearchParams({ path: activeServerSource.path, lines: lineLimitSelect.value || '2000' });
                 if (startLine !== null && startLine !== undefined) qs.set('start', String(startLine));
                 return `/api/jsonl-tail?${qs.toString()}`;
             }
             return '';
+        }
+
+        async function loadAttributedSources() {
+            if (!sid || !modelRaw || segmentIndex === '') return;
+            try {
+                const qs = new URLSearchParams({
+                    session_id: sid,
+                    model_raw: modelRaw,
+                    segment_index: segmentIndex
+                });
+                const response = await fetch(`/api/cost-v4/log-sources?${qs.toString()}`);
+                if (!response.ok) return;
+                const payload = await response.json();
+                const primary = activeServerSource;
+                serverSources = [primary, ...(payload.sources || []).map(source => ({
+                    kind: source.sid ? 'transcript' : 'path',
+                    sid: source.sid,
+                    callCount: source.calls || 0,
+                    path: source.path,
+                    label: `${source.label} (${source.path || source.sid})`
+                }))];
+                if (serverSources.length < 2) return;
+                sourceSelect.replaceChildren();
+                serverSources.forEach((source, index) => {
+                    const option = document.createElement('option');
+                    option.value = String(index);
+                    option.textContent = source.label;
+                    sourceSelect.appendChild(option);
+                });
+                sourcePicker.hidden = false;
+                // The API orders evidence by latest activity, not historical size.
+                const runtimeIndex = serverSources.findIndex(source => source.kind === 'path');
+                if (runtimeIndex > 0) {
+                    sourceSelect.value = String(runtimeIndex);
+                    activeServerSource = serverSources[runtimeIndex];
+                }
+            } catch (err) {
+                // The primary transcript still works if evidence discovery fails.
+            }
         }
 
         function escapeHtml(value) {
@@ -315,7 +403,10 @@
             return text.split('\n').map(line => {
                 const indent = (line.match(/^ */) || [''])[0].length;
                 const depth = Math.floor(indent / 3);
-                return `<span class="json-line">${highlightJson(line, depth)}</span>`;
+                const keyPrefix = line.match(/^(\s*"(?:\\.|[^"\\])*":\s*)/);
+                const hangIndent = keyPrefix ? keyPrefix[0].length + (line[keyPrefix[0].length] === '"' ? 1 : 0) : indent;
+                const hang = hangIndent > 0 ? ` style="--hang:${hangIndent}ch"` : '';
+                return `<span class="json-line"${hang}>${highlightJson(line, depth)}</span>`;
             }).join('');
         }
 
@@ -381,6 +472,7 @@
 
             toggle.addEventListener('click', () => {
                 expanded = !expanded;
+                row.classList.toggle('is-expanded', expanded);
                 toggle.textContent = expanded ? '▼' : '▶';
                 toggle.title = expanded ? 'Collapse line' : 'Expand line';
 
@@ -470,7 +562,7 @@
                 return;
             }
 
-            const sourceLabel = sid ? (displayPath || ('sqlite:' + sid)) : (filePath || fileUrl);
+            const sourceLabel = activeServerSource?.label || 'server log';
             fileLabel.textContent = sourceLabel;
 
             try {
@@ -478,7 +570,7 @@
                 if (!response.ok) {
                     throw new Error(`HTTP ${response.status}`);
                 }
-                if (filePath && !fileUrl) {
+                if (activeServerSource?.kind === 'path') {
                     const payload = await response.json();
                     if (!payload.ok) throw new Error(payload.error || 'tail endpoint failed');
                     renderJsonlText(payload.text || '', sourceLabel, payload);
@@ -588,12 +680,21 @@
             return Array.from(dataTransfer.files || []);
         }
 
-        wrapToggle.addEventListener('change', () => {
-            document.body.classList.toggle('wrap', wrapToggle.checked);
-        });
+        function syncWrapModes() {
+            document.body.classList.toggle('wrap-expanded', wrapExpandedToggle.checked);
+            document.body.classList.toggle('wrap-unexpanded', wrapUnexpandedToggle.checked);
+        }
+
+        wrapExpandedToggle.addEventListener('change', syncWrapModes);
+        wrapUnexpandedToggle.addEventListener('change', syncWrapModes);
 
         lineLimitSelect.addEventListener('change', () => {
-            if (filePath && !fileUrl) loadServerJsonl();
+            if (activeServerSource?.kind === 'path') loadServerJsonl();
+        });
+
+        sourceSelect.addEventListener('change', () => {
+            activeServerSource = serverSources[Number(sourceSelect.value)] || serverSources[0];
+            loadServerJsonl();
         });
 
         prevSliceButton.addEventListener('click', () => {
@@ -663,7 +764,12 @@
             });
         }
 
-        loadServerJsonl();
+        async function initializeViewer() {
+            await loadAttributedSources();
+            loadServerJsonl();
+        }
+
+        initializeViewer();
     </script>
 </body>
 </html>

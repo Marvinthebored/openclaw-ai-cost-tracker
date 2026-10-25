@@ -20,6 +20,7 @@ import re
 import sys
 import time
 import shutil
+import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -82,6 +83,7 @@ CODEX_APP_SERVER_IDEMPOTENCY_RE = re.compile(
     r"(?P<turn_id>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}):"
     r"(?P<role>user|assistant):(?P<index>\d+)$"
 )
+CODEX_APP_SERVER_THREAD_RE = re.compile(r"^codex-app-server:(?P<thread_id>[0-9a-f-]{36}):")
 _OPENCLAW_CODEX_THREAD_IDS_CACHE = None
 _OPENCLAW_SESSION_INDEX_CACHE = None
 
@@ -212,7 +214,7 @@ _PAYG_RATECARD_CACHE = None
 # non-cached input is ~1200/message. We previously OVERRODE input to a flat
 # 1200 at INGEST time (destructive: raw was lost).
 #
-# CHANGE 2026-06-11: store RAW Pioneer session-log data in the DB so we
+# CHANGE 2026-06-11 : store RAW Pioneer session-log data in the DB so we
 # can see whether Pioneer ever fixes their API. The 1200 estimate now lives in
 # the VIEWER as a per-model toggle (override applied locally, not persisted).
 # These constants are kept so the viewer/ratecard layer can reference the
@@ -279,6 +281,49 @@ def load_payg_ratecard():
     return rates
 
 
+# Terminal-owned (hand-run CLI) sessions carry an unambiguous `cli-` prefix so a
+# model_raw says who OWNED the session, not merely which log it came from. `claude/` is genuinely mixed -- the same ~/.claude/projects tree
+# holds both hand-run and OpenClaw-driven (sdk-*) transcripts -- so the rewrite
+# is conditional on session kind, never a blanket string replace.
+CLI_MODEL_PREFIXES = {
+    "claude/": "cli-claude/",
+    "codex/": "cli-codex/",
+    "kimi-code/": "cli-kimi/",
+}
+# The other half of the same rule (ownership convention): if a Claude-family row is
+# NOT terminal-owned it is OpenClaw-owned, and its provider is Anthropic. The
+# `(c)` marks that OpenClaw reached Anthropic through the Claude CLI credential
+# rather than the API directly -- a routing detail, not an owner.
+OC_CLAUDE_PREFIXES = {
+    "claude/": "anthropic-c/",
+    "claude-cli/": "anthropic/",
+}
+# Reverse map: a renamed prefix resolves to the ratecard entry it came from.
+CLI_RATECARD_FALLBACK = {
+    "cli-claude/": "claude/",
+    "cli-codex/": "codex_cli/",
+    "cli-kimi/": "kimi-code/",
+    "anthropic-c/": "claude/",
+}
+
+
+def cli_prefixed_model_raw(model_raw: str, session_kind: str) -> str:
+    """Rewrite a model_raw so its prefix names the session's OWNER.
+
+    Terminal-owned -> `cli-<tool>/`; OpenClaw-owned Claude -> `anthropic[(c)]/`.
+    `claude/` is genuinely mixed (the same ~/.claude/projects tree holds hand-run
+    and OpenClaw-driven transcripts), so ownership comes from session kind, never
+    from the string. Idempotent: an already-rewritten prefix matches nothing.
+    """
+    if not model_raw:
+        return model_raw
+    table = CLI_MODEL_PREFIXES if session_kind == "cli" else OC_CLAUDE_PREFIXES
+    for old, new in table.items():
+        if model_raw.startswith(old):
+            return new + model_raw[len(old):]
+    return model_raw
+
+
 def calculate_payg_equivalent_cost(model_raw: str, usage: dict):
     """Return token PAYG-equivalent cost for CLI rows, or None if no rate exists.
 
@@ -288,6 +333,21 @@ def calculate_payg_equivalent_cost(model_raw: str, usage: dict):
     """
     rates = load_payg_ratecard()
     rate = rates.get(model_raw)
+    if not rate:
+        # cli-<x>/ is an ownership label, not a second provider: the token rates
+        # are the ones already carded under the pre-rename prefix.
+        for cli_prefix, card_prefix in CLI_RATECARD_FALLBACK.items():
+            if model_raw.startswith(cli_prefix):
+                model_name = model_raw[len(cli_prefix):]
+                rate = rates.get(f"{card_prefix}{model_name}")
+                if not rate and cli_prefix == "cli-codex/":
+                    rate = rates.get(f"openai/{model_name}")
+                break
+    if not rate and model_raw.startswith(("claude-cli/", "anthropic/")):
+        # Anthropic token rates do not depend on how OpenClaw reached them, so
+        # both the API and Claude-CLI credential routes price off the same card.
+        _, model_name = model_raw.split("/", 1)
+        rate = rates.get(f"claude/{model_name}")
     if not rate and model_raw.startswith(("codex/", "openai-codex/")):
         _, model_name = model_raw.split("/", 1)
         rate = rates.get(f"openai/{model_name}") or rates.get(f"codex_cli/{model_name}")
@@ -314,7 +374,7 @@ def maybe_calculate_cli_cost(model_raw: str, usage: dict, cost=None):
     cost = cost or {}
     if any((cost.get(k) or 0) for k in ("input", "output", "cacheRead", "cacheWrite", "total")):
         return cost
-    if model_raw.startswith(("codex_cli/", "claude/", "openai/", "openai-codex/", "codex/", "pioneer/", "pioneer-ai/", "kimi-code/")):
+    if model_raw.startswith(("codex_cli/", "claude/", "claude-cli/", "openai/", "openai-codex/", "codex/", "pioneer/", "pioneer-ai/", "kimi-code/", "zai/", "cli-claude/", "cli-codex/", "cli-kimi/", "anthropic/", "anthropic-c/")):
         calculated = calculate_payg_equivalent_cost(model_raw, usage)
         if calculated is not None:
             return calculated
@@ -325,7 +385,7 @@ def apply_pioneer_input_estimate(model_raw: str, timestamp: str | None, usage: d
     """Override Pioneer streaming input tokens with a flat estimate.
 
     Pioneer's streamed usage reports input tokens unreliably (zero, or grossly
-    inflated gross-prompt). For the `pioneer/`
+    inflated gross-prompt). For legacy compatibility, for the `pioneer/`
     opus|sonnet|haiku rows we replace input with a flat ~1200/message estimate
     (derived from a day of Pioneer web usage) on EVERY matching line from
     2026-06-05 onward. pioneer-ai/ and other providers are not touched.
@@ -380,12 +440,12 @@ def ensure_cost_metadata_columns(conn):
     conn.commit()
 
 
-def backfill_cli_payg_costs(conn, session_ids=None):
+def backfill_cli_payg_costs(conn, session_ids=None, since_timestamp=None):
     """Backfill zero-cost CLI-style messages from token usage + owned ratecard.
 
     If session_ids is provided (incremental refresh), only those sessions are
-    scanned. A full pass (session_ids=None) scans the whole DB. Scoping avoids
-    re-fetching ~10k permanently-zero rows on every 5-minute refresh.
+    scanned. If since_timestamp is provided, only messages at or after that
+    timestamp are scanned. With neither filter, the whole DB is scanned.
     """
     ensure_cost_metadata_columns(conn)
     cur = conn.cursor()
@@ -397,19 +457,26 @@ def backfill_cli_payg_costs(conn, session_ids=None):
     base_sql = """SELECT m.id, m.session_id, mr.model_raw, m.input_tokens, m.output_tokens,
                   m.cache_read, m.cache_write, m.total_tokens,
                   m.cost_input, m.cost_output, m.cost_cache_read, m.cost_cache_write, m.cost_total
-           FROM messages m
+           FROM effective_messages m
            JOIN model_reference mr ON mr.id = m.model_ref_id
            WHERE (mr.model_raw LIKE 'codex_cli/%' OR mr.model_raw LIKE 'claude/%'
+                  OR mr.model_raw LIKE 'claude-cli/%'
                   OR mr.model_raw LIKE 'openai/%' OR mr.model_raw LIKE 'openai-codex/%'
                   OR mr.model_raw LIKE 'codex/%'
                   OR mr.model_raw LIKE 'pioneer/%' OR mr.model_raw LIKE 'pioneer-ai/%'
-                  OR mr.model_raw LIKE 'kimi-code/%')
+                  OR mr.model_raw LIKE 'kimi-code/%' OR mr.model_raw LIKE 'zai/%'
+                  OR mr.model_raw LIKE 'cli-%'
+                  OR mr.model_raw LIKE 'anthropic%')
              AND COALESCE(m.cost_total, 0) = 0"""
+    params = []
+    if since_timestamp is not None:
+        base_sql += " AND m.timestamp >= ?"
+        params.append(since_timestamp)
     if scope_ids is not None:
         placeholders = ",".join("?" * len(scope_ids))
-        rows = cur.execute(base_sql + f" AND m.session_id IN ({placeholders})", scope_ids).fetchall()
-    else:
-        rows = cur.execute(base_sql).fetchall()
+        base_sql += f" AND m.session_id IN ({placeholders})"
+        params.extend(scope_ids)
+    rows = cur.execute(base_sql, params).fetchall()
     updated = 0
     touched_sessions = set()
     missing_rates = set()
@@ -447,10 +514,13 @@ def backfill_cli_payg_costs(conn, session_ids=None):
            WHERE session_id IN (SELECT DISTINCT m.session_id
                                 FROM messages m JOIN model_reference mr ON mr.id = m.model_ref_id
                                 WHERE mr.model_raw LIKE 'codex_cli/%' OR mr.model_raw LIKE 'claude/%'
+                                   OR mr.model_raw LIKE 'claude-cli/%'
                                    OR mr.model_raw LIKE 'openai/%' OR mr.model_raw LIKE 'openai-codex/%'
                                    OR mr.model_raw LIKE 'codex/%'
                                    OR mr.model_raw LIKE 'pioneer/%' OR mr.model_raw LIKE 'pioneer-ai/%'
-                                   OR mr.model_raw LIKE 'kimi-code/%')
+                                   OR mr.model_raw LIKE 'kimi-code/%' OR mr.model_raw LIKE 'zai/%'
+                                   OR mr.model_raw LIKE 'cli-%'
+                                   OR mr.model_raw LIKE 'anthropic%')
              AND COALESCE(cost_total, 0) > 0
              AND cost_source IS NULL"""
     if scope_ids is not None:
@@ -569,12 +639,11 @@ def maybe_backup_db(db_path: Path, max_age_hours: int = 24, keep: int = 14):
 
 # --- Model reference helpers ---
 
-def canonical_model_display_name(model_raw: str) -> str:
-    """Return the compact, provider-free model label used by the dashboard.
+def best_guess_model_display_name(model_raw: str) -> str:
+    """Return a compact initial display label for a newly seen raw model.
 
-    `model_raw` remains untouched as the accounting/provenance key. This alias
-    is deliberately presentation-only so routes such as Anthropic, Pioneer,
-    Nonstop and Claude CLI can group under the same human-readable model.
+    This is insertion-time inference only. Once a row exists, model_reference
+    is authoritative and its editable aliases must never be rewritten here.
     """
     if not model_raw:
         return "unknown"
@@ -636,7 +705,8 @@ def infer_model_reference(model_raw: str):
 
     if provider == "openai-codex":
         endpoint, author = "openai-codex", "OpenAI"
-    elif provider == "codex":
+    elif provider in ("codex", "cli-codex"):
+        # cli-codex/ is codex/ with terminal ownership made explicit; same endpoint.
         endpoint, author = "codex", "OpenAI"
     elif provider == "openai":
         endpoint, author = "openai", "OpenAI"
@@ -651,11 +721,20 @@ def infer_model_reference(model_raw: str):
             author = "OpenAI"
         elif "grok" in ml:
             author = "xAI"
-    elif provider == "anthropic":
+    elif provider in ("anthropic", "anthropic-c"):
+        # anthropic-c is OpenClaw reaching Anthropic through the Claude CLI
+        # credential rather than the API. That is a routing detail, so it keeps
+        # the same endpoint -- one provider in the dashboard, not two.
         endpoint, author = "anthropic", "Anthropic"
-    elif provider == "claude":
+    elif provider in ("claude", "claude-cli", "cli-claude"):
+        # claude-cli/X is the OpenClaw wrapper's counters for the same Anthropic
+        # model that claude/X reads from Claude's own transcript. The prefix
+        # records which log the row came from, not a second provider -- every
+        # rate lookup below already folds them together. Without this, the
+        # yellow provider column (model_reference.endpoint) split one endpoint
+        # into CLAUDE and CLAUDE-CLI for identical OpenClaw-owned work.
         endpoint, author = "claude", "Anthropic"
-    elif provider in ("kimi-coding", "kimi-code", "kimi", "moonshot"):
+    elif provider in ("kimi-coding", "kimi-code", "kimi", "moonshot", "cli-kimi"):
         endpoint, author = ("moonshot" if provider == "moonshot" else "kimi-code"), "Moonshot"
     elif provider in ("bailian", "bailian-token-plan"):
         endpoint, author = "bailian", "Alibaba"
@@ -704,72 +783,19 @@ def infer_model_reference(model_raw: str):
     return (
         endpoint,
         author,
-        canonical_model_display_name(model_raw),
+        best_guess_model_display_name(model_raw),
         pru_multiplier,
     )
 
 
-# Safe endpoint normalisation: aliases that are ALWAYS collapsed because the
-# left-hand value is never an intentional billing split (it is a leftover
-# provider/transport spelling). Intentional groupings (pioneer vs pioneer-ai,
-# moonshot vs kimi-code, openai vs openai-codex, the anthropic/claude family,
-# deepseek routes) are NOT listed here — those wait for an explicit decision.
-MODEL_ENDPOINT_ALIASES = {
-    "codex_cli": "openai-codex",
-    "kimi": "kimi-code",
-    "kimi-coding": "kimi-code",
-    "ollama": "opencode",
-    "ollama-cloud": "opencode",
-    "opencode-go": "opencode",
-    "bailian-token-plan": "bailian",
-    "deepseek-direct": "deepseek",
-}
-
-
-def normalize_model_reference_aliases(conn):
-    """Apply the canonical display policy to existing and newly-seen models."""
-    cur = conn.cursor()
-    rows = cur.execute(
-        "SELECT id, model_raw, endpoint FROM model_reference"
-    ).fetchall()
-    updated = 0
-    for model_id, model_raw, endpoint in rows:
-        display = canonical_model_display_name(model_raw)
-        canonical_endpoint = "openai-codex" if model_raw.startswith("codex_cli/") else endpoint
-        canonical_endpoint = MODEL_ENDPOINT_ALIASES.get(canonical_endpoint, canonical_endpoint)
-        cur.execute(
-            """
-            UPDATE model_reference
-            SET model = ?, endpoint = ?
-            WHERE id = ? AND (model != ? OR endpoint != ?)
-            """,
-            (display, canonical_endpoint, model_id, display, canonical_endpoint),
-        )
-        updated += cur.rowcount
-    conn.commit()
-    return updated
-
-
 def ensure_model_reference(cur, model_raw: str):
-    """Ensure model_reference contains model_raw so FK constraints won't halt ingest."""
+    """Insert a best-guess row for an unseen model without touching existing aliases."""
     if not model_raw:
         return
     endpoint, author, model, pru_multiplier = infer_model_reference(model_raw)
     cur.execute(
         "INSERT OR IGNORE INTO model_reference (model_raw, endpoint, author, model, pru_multiplier) VALUES (?, ?, ?, ?, ?)",
         (model_raw, endpoint, author, model, pru_multiplier),
-    )
-    cur.execute(
-        """
-        UPDATE model_reference
-        SET endpoint = ?, author = ?, model = ?, pru_multiplier = ?
-        WHERE model_raw = ?
-          AND (
-              COALESCE(author, '') IN ('', 'Unknown')
-              OR endpoint IN ('kimi', 'bailian-token-plan', 'opencode-go')
-          )
-        """,
-        (endpoint, author, model, pru_multiplier, model_raw),
     )
 
 
@@ -974,8 +1000,82 @@ def extract_codex_session_id_from_path(filepath: Path):
 def extract_codex_thread_id_from_idempotency_key(value):
     if not isinstance(value, str):
         return None
-    match = CODEX_APP_SERVER_IDEMPOTENCY_RE.match(value)
+    match = CODEX_APP_SERVER_THREAD_RE.match(value)
     return match.group("thread_id") if match else None
+
+
+def codex_is_openclaw_runtime(originator, in_agent_home=False):
+    # An explicit standalone launcher wins over the shared storage directory.
+    return originator == "openclaw" if originator else bool(in_agent_home)
+
+
+def read_codex_session_meta(filepath: Path):
+    """Return the first Codex session_meta payload without reading the transcript."""
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    data = json.loads(line)
+                except Exception:
+                    continue
+                if data.get("type") == "session_meta":
+                    payload = data.get("payload")
+                    return payload if isinstance(payload, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def read_claude_entrypoint(filepath: Path):
+    """Return a Claude transcript's `entrypoint` without reading the whole file.
+
+    Claude records the launcher on every line; the Codex analogue is
+    `session_meta.payload.originator`.
+    """
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            for line_num, line in enumerate(f):
+                if line_num > 40:
+                    break
+                try:
+                    data = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(data, dict) and data.get("entrypoint"):
+                    return data["entrypoint"]
+    except Exception:
+        pass
+    return None
+
+
+CLAUDE_SDK_ENTRYPOINTS = ("sdk-cli", "sdk-ts", "sdk-py")
+
+
+def claude_session_kind(entrypoint):
+    """Claude transcripts record their launcher in `entrypoint`; this is the
+    Claude analogue of Codex's `originator`.
+
+    Any `sdk-*` entrypoint is an embedding harness (OpenClaw here) driving
+    Claude programmatically -- `sdk-ts` is the older TypeScript agent SDK,
+    `sdk-cli` the current one. Bare 'cli' is a hand-run terminal session.
+    Unknown/missing stays 'cli': do not promote a session to OpenClaw on a
+    guess.
+    """
+    return "openclaw" if entrypoint in CLAUDE_SDK_ENTRYPOINTS else "cli"
+
+
+def codex_filepath_from_storage_name(storage_name: str):
+    """Resolve a tracker codex_cli:* storage key back to its transcript path."""
+    if not isinstance(storage_name, str) or not storage_name.startswith("codex_cli:"):
+        return None
+    app_prefix = "codex_cli:codex-home/"
+    if storage_name.startswith(app_prefix):
+        rest = storage_name[len(app_prefix):]
+        agent, sep, rel = rest.partition("/")
+        if not sep or not agent or not rel:
+            return None
+        return OPENCLAW_AGENTS_DIR / agent / "agent" / "codex-home" / "sessions" / rel
+    return CODEX_SESSIONS_DIR / storage_name[len("codex_cli:"):]
 
 
 def extract_codex_session_id_from_meta(data):
@@ -1110,6 +1210,201 @@ def collect_openclaw_codex_thread_ids(force_refresh=False):
     return thread_ids
 
 
+def openclaw_source_connection(path):
+    """Read current compressed events and legacy JSON without changing the store."""
+    from compression import zstd
+
+    conn = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)
+    columns = {row[1] for row in conn.execute("PRAGMA main.table_info(transcript_events)")}
+    if "event_zstd" in columns:
+        conn.create_function("decode_event", 1, lambda blob: zstd.decompress(blob).decode("utf-8") if blob else None)
+        selected = ["rowid AS rowid"]
+        selected += [
+            'COALESCE(event_json, decode_event(event_zstd)) AS event_json' if col == "event_json"
+            else '"' + col.replace('"', '""') + '"'
+            for col in sorted(columns)
+        ]
+        conn.execute("CREATE TEMP VIEW transcript_events AS SELECT " + ", ".join(selected) + " FROM main.transcript_events")
+    return conn
+
+
+def resolve_tracker_runtime_path(storage_name, config):
+    """Resolve runtime keys under the configured, traversal-checked source roots."""
+    roots = [
+        ("claude:", config["claude_projects_dir"]),
+        ("codex_cli:", config["codex_sessions_dir"]),
+        ("kimi_code:", config["kimi_code_dir"]),
+    ]
+    match = re.match(r"^codex_cli:codex-home/([^/]+)/(.+)$", storage_name or "")
+    if match:
+        roots.insert(0, ("codex_cli:codex-home/", config["openclaw_agents_dir"]))
+        relative = Path(match[1]) / "agent" / "codex-home" / "sessions" / match[2]
+        root = Path(config["openclaw_agents_dir"]).resolve()
+    else:
+        found = next(((prefix, Path(root)) for prefix, root in roots if (storage_name or "").startswith(prefix)), None)
+        if not found:
+            return None
+        prefix, root = found
+        root = root.resolve()
+        relative = Path(storage_name[len(prefix):])
+    path = (root / relative).resolve()
+    return str(path) if path.is_relative_to(root) else None
+
+
+def archived_codex_transcript_lines(source_conn):
+    """(session_id, None, line) for Codex-routed lines in archived transcripts."""
+    from compression import zstd
+
+    out = []
+    try:
+        archives = source_conn.execute(
+            "SELECT session_id, encoding, archive_blob FROM session_transcript_archives"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return out  # older agent DB without the table
+    for session_id, encoding, blob in archives:
+        try:
+            data = zstd.decompress(blob) if encoding == "zstd" else blob
+            text = data.decode("utf-8")
+        except Exception:
+            continue
+        out.extend(
+            (session_id, None, line)
+            for line in text.splitlines()
+            if "codex-app-server:" in line
+        )
+    return out
+
+
+def collect_openclaw_codex_thread_routes(include_unrouted=False):
+    """Map Codex thread ids to their OpenClaw session and recorded model pair.
+
+    The idempotency key is the explicit join key. No timestamp-only attribution
+    is allowed here: if a thread maps to more than one OpenClaw session, it is
+    deliberately omitted and remains an unlinked OpenClaw runtime record.
+    With include_unrouted=True such threads are returned with session_id None
+    (their OpenClaw message_ids are still exact, and are what
+    supersede_routed_openclaw_turn_rows() needs).
+    """
+    collected = {}
+
+    def add(thread_id, session_id, provider=None, model=None, message_id=None):
+        if not thread_id or not session_id:
+            return
+        item = collected.setdefault(
+            thread_id,
+            {"session_ids": set(), "model_pairs": set(), "message_ids": set()},
+        )
+        item["session_ids"].add(session_id)
+        if provider and model:
+            item["model_pairs"].add((str(provider), str(model)))
+        if message_id:
+            item["message_ids"].add(message_id)
+
+    for source in collect_openclaw_sqlite_sources():
+        db_path = source["path"]
+        try:
+            source_conn = openclaw_source_connection(db_path)
+            try:
+                rows = source_conn.execute(
+                    """
+                    SELECT session_id, seq, event_json
+                    FROM transcript_events
+                    WHERE event_json LIKE '%codex-app-server:%'
+                    """
+                ).fetchall()
+                # OpenClaw deletes isolated sessions (cron, cleanup=delete
+                # subagents) and moves their transcript into an archive. Routes
+                # are rebuilt every refresh, so without these the turn row and
+                # its rollout calls both count again once the session is gone.
+                rows += archived_codex_transcript_lines(source_conn)
+                for session_id, seq, raw in rows:
+                    try:
+                        event = json.loads(raw)
+                    except Exception:
+                        continue
+                    message = event.get("message") if isinstance(event.get("message"), dict) else {}
+                    thread_id = extract_codex_thread_id_from_idempotency_key(
+                        message.get("idempotencyKey")
+                    )
+                    message_id = None
+                    if message.get("role") == "assistant":
+                        # Same id rule as ingest_openclaw_sqlite(). Archived
+                        # lines have no seq, so only a real event id counts.
+                        message_id = event.get("id") or (
+                            f"openclaw-sqlite:{source['agent']}:{session_id}:{seq}"
+                            if seq is not None else None
+                        )
+                    add(
+                        thread_id,
+                        session_id,
+                        message.get("provider"),
+                        message.get("model"),
+                        message_id,
+                    )
+            finally:
+                source_conn.close()
+        except Exception:
+            continue
+
+    # Historical JSONL remains useful after older SQLite windows have rotated.
+    for source in OPENCLAW_SESSION_SOURCES:
+        for filepath in collect_openclaw_session_files(source):
+            session_id = None
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    for line in f:
+                        if "codex-app-server:" not in line and session_id is not None:
+                            continue
+                        try:
+                            event = json.loads(line)
+                        except Exception:
+                            continue
+                        if event.get("type") == "session" and event.get("id"):
+                            session_id = event.get("id")
+                        message = event.get("message") if isinstance(event.get("message"), dict) else {}
+                        thread_id = extract_codex_thread_id_from_idempotency_key(
+                            message.get("idempotencyKey")
+                        )
+                        if thread_id:
+                            add(
+                                thread_id,
+                                session_id or filepath.name.split(".jsonl", 1)[0],
+                                message.get("provider"),
+                                message.get("model"),
+                                event.get("id") if message.get("role") == "assistant" else None,
+                            )
+            except Exception:
+                continue
+
+    routes = {}
+    for thread_id, item in collected.items():
+        if len(item["session_ids"]) != 1 and not include_unrouted:
+            continue
+        routes[thread_id] = {
+            "session_id": next(iter(item["session_ids"])) if len(item["session_ids"]) == 1 else None,
+            "model_pairs": set(item["model_pairs"]),
+            "message_ids": set(item["message_ids"]),
+        }
+    return routes
+
+
+def codex_route_model_raw(route, runtime_model_raw: str):
+    """Resolve an OpenClaw-recorded provider/model for one Codex runtime model."""
+    pairs = set((route or {}).get("model_pairs") or ())
+    runtime_model = runtime_model_raw.split("/", 1)[-1]
+    exact = {(provider, model) for provider, model in pairs if model == runtime_model}
+    if len(exact) == 1:
+        provider, model = next(iter(exact))
+        return f"{provider}/{model}"
+    if len(pairs) == 1:
+        provider, model = next(iter(pairs))
+        return f"{provider}/{model}"
+    # codex app-server is OpenAI's runtime. This branch is only used when the
+    # OpenClaw transcript has rotated before its model-bearing event was read.
+    return f"openai/{runtime_model}"
+
+
 def is_codex_session_mirrored_by_openclaw(filepath: Path):
     session_id = extract_codex_session_id_from_file(filepath)
     return bool(session_id and session_id in collect_openclaw_codex_thread_ids())
@@ -1232,7 +1527,7 @@ def insert_message_row(
     )
     had_source_cost = any((source_cost.get(k) or 0) for k in ("input", "output", "cacheRead", "cacheWrite", "total"))
     cost = maybe_calculate_cli_cost(model_raw, usage, source_cost)
-    calculated_cost = (not had_source_cost) and model_raw.startswith(("codex_cli/", "claude/", "openai/", "kimi-code/")) and bool(cost.get("total"))
+    calculated_cost = (not had_source_cost) and model_raw.startswith(("codex/", "codex_cli/", "claude/", "openai/", "kimi-code/", "zai/", "cli-claude/", "cli-codex/", "cli-kimi/", "anthropic/", "anthropic-c/")) and bool(cost.get("total"))
     cost_source = estimate_source
     cost_kind = estimate_kind
     cost_is_estimated = is_estimated
@@ -1335,13 +1630,18 @@ def ingest_openclaw_messages_from_offset(
 
 def ingest_codex_messages_from_offset(filepath: Path, conn, start_offset: int, session_id: str):
     """Append-only ingest for Codex CLI token-count events."""
-    if is_codex_session_mirrored_by_openclaw(filepath):
-        return 0
-
     cur = conn.cursor()
     processed = 0
     current_model = get_last_model_for_session(cur, session_id)
     seen_token_count_states = set()
+    session_row = cur.execute(
+        "SELECT session_type FROM sessions WHERE session_id = ?",
+        (session_id,),
+    ).fetchone()
+    session_meta = read_codex_session_meta(Path(filepath))
+    is_openclaw_runtime = codex_is_openclaw_runtime(
+        session_meta.get("originator"), codex_app_server_root_for(filepath)
+        or (session_row and session_row[0] == "openclaw"))
 
     with open(filepath, 'rb') as f:
         f.seek(start_offset)
@@ -1370,7 +1670,8 @@ def ingest_codex_messages_from_offset(filepath: Path, conn, start_offset: int, s
             seen_token_count_states.add(dedupe_key)
 
             model_name = current_model or "unknown"
-            model_raw = f"codex_cli/{model_name}"
+            provider = "openai" if is_openclaw_runtime else "cli-codex"
+            model_raw = f"{provider}/{model_name}"
             msg_id = f"{session_id}:codex:{line_offset}"
             normalized_usage = normalize_codex_usage(last_usage)
             insert_message_row(
@@ -1383,7 +1684,7 @@ def ingest_codex_messages_from_offset(filepath: Path, conn, start_offset: int, s
                 normalized_usage,
                 ingest_source=(
                     "codex_app_server"
-                    if codex_app_server_root_for(filepath)
+                    if is_openclaw_runtime
                     else "codex_cli"
                 ),
             )
@@ -1448,7 +1749,7 @@ def insert_kimi_session_stub(cur, filepath: Path, session_id: str, storage_name:
          channel_id, channel_name, channel_type, session_type, deleted_at)
         VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?, NULL)
         """,
-        (session_id, session_nickname, label, storage_name, created_at, "gui", "kimi_code"),
+        (session_id, session_nickname, label, storage_name, created_at, "cli", "cli"),
     )
 
 
@@ -1476,6 +1777,8 @@ def parse_kimi_session_file(filepath, conn):
                 model_raw = data.get("model")
                 if not isinstance(model_raw, str) or not model_raw:
                     model_raw = "kimi-code/unknown"
+                # Kimi Code is always terminal-owned (session stub hardcodes cli).
+                model_raw = cli_prefixed_model_raw(model_raw, "cli")
                 usage = normalize_kimi_usage(data.get("usage"))
                 timestamp = datetime.fromtimestamp((data.get("time") or 0) / 1000, tz=timezone.utc).isoformat() if data.get("time") else created_at
                 msg_id = f"{session_id}:kimi:{agent_id}:{line_num}"
@@ -1524,6 +1827,8 @@ def ingest_kimi_messages_from_offset(filepath: Path, conn, start_offset: int, se
             model_raw = data.get("model")
             if not isinstance(model_raw, str) or not model_raw:
                 model_raw = "kimi-code/unknown"
+            # Kimi Code is always terminal-owned (session stub hardcodes cli).
+            model_raw = cli_prefixed_model_raw(model_raw, "cli")
             usage = normalize_kimi_usage(data.get("usage"))
             timestamp = datetime.fromtimestamp((data.get("time") or 0) / 1000, tz=timezone.utc).isoformat() if data.get("time") else created_at
             msg_id = f"{session_id}:kimi:{agent_id}:{line_offset}"
@@ -1553,7 +1858,7 @@ def ingest_messages_from_offset(filepath: Path, conn, start_offset: int, session
 
 
 def recompute_segments(conn, session_id: str):
-    """Recompute model segments from archived messages in the DB."""
+    """Recompute model/reset-generation segments from archived messages."""
     cur = conn.cursor()
 
     # Delete only derived data (segments). Messages are the archive.
@@ -1563,7 +1868,7 @@ def recompute_segments(conn, session_id: str):
         """SELECT m.timestamp, mr.model_raw, m.input_tokens, m.output_tokens, m.cache_read, m.cache_write, m.total_tokens,
                   m.cost_input, m.cost_output, m.cost_cache_read, m.cost_cache_write, m.cost_total,
                   m.cost_is_estimated
-           FROM messages m
+           FROM effective_messages m
            INNER JOIN model_reference mr ON mr.id = m.model_ref_id
            WHERE m.session_id = ?
              AND COALESCE(m.is_excluded, 0) = 0
@@ -1574,12 +1879,24 @@ def recompute_segments(conn, session_id: str):
     if not rows:
         return
 
+    boundary_rows = cur.execute(
+        """
+        SELECT timestamp
+        FROM session_boundaries
+        WHERE session_id = ?
+        ORDER BY timestamp, source, event_seq
+        """,
+        (session_id,),
+    ).fetchall()
+    reset_timestamps = [row[0] for row in boundary_rows if row[0]]
+
     def is_mirror(model_raw: str):
         return model_raw == 'openclaw/delivery-mirror'
 
     segment_index = 0
     seg_model = None
     seg_rows = []
+    boundary_index = 0
 
     def flush():
         nonlocal segment_index, seg_rows
@@ -1625,6 +1942,12 @@ def recompute_segments(conn, session_id: str):
         ts, model_raw = row[0], row[1]
         if not model_raw or is_mirror(model_raw):
             continue
+        while boundary_index < len(reset_timestamps) and reset_timestamps[boundary_index] <= ts:
+            boundary_ts = reset_timestamps[boundary_index]
+            if seg_rows and boundary_ts > seg_rows[-1][0]:
+                flush()
+                seg_model = None
+            boundary_index += 1
         if seg_model is None:
             seg_model = model_raw
         if model_raw != seg_model:
@@ -1696,75 +2019,598 @@ def backfill_message_ingest_sources(conn):
     conn.commit()
 
 
-def propagate_claude_wrapper_provenance(conn):
-    """Give retained Claude usage the OpenClaw source that invoked it.
+def backfill_cli_model_prefixes(conn):
+    """Repoint messages/segments so a model_raw prefix names the session's OWNER.
 
-    The accurate token row lives in the Claude transcript, while the excluded
-    wrapper row owns the Discord/GUI/subagent context. Propagate that context
-    only across an explicit duplicate pointer; unrelated manual Claude CLI
-    sessions remain labelled CLI.
+    Terminal-owned -> `cli-<tool>/`; everything else Claude-family is
+    OpenClaw-owned -> `anthropic[(c)]/` (ownership convention). This cannot be a
+    blanket string rewrite: `claude/` is genuinely mixed, holding both hand-run
+    and OpenClaw-driven transcripts, so ownership is read from
+    `sessions.session_type`, never guessed from the prefix. Idempotent -- rows
+    already carrying a rewritten prefix do not match the source patterns.
+
+    Note the endpoint column is carried across unchanged: `cli-codex/` is an
+    ownership label, and the dashboard's provider column stays `codex`.
     """
     cur = conn.cursor()
-    grouped = {}
-    for row in cur.execute(
-        """
-        SELECT
-            cli.session_id,
-            wrapper_session.session_type,
-            wrapper_session.channel_type,
-            wrapper_session.channel_name,
-            wrapper_session.parent_nickname
-        FROM messages wrapper
-        JOIN messages cli ON cli.id = wrapper.duplicate_of
-        JOIN sessions wrapper_session
-          ON wrapper_session.session_id = wrapper.session_id
-        WHERE wrapper.excluded_reason = 'duplicate_claude_wrapper_cli'
-          AND wrapper.is_excluded = 1
-          AND cli.session_id IS NOT NULL
-        """
+    moved = 0
+    # (prefix table, ownership predicate). 'cli' is terminal-owned; anything
+    # else reaching a Claude-family model is OpenClaw driving it.
+    for table, owned_sql, endpoint_override in (
+        (CLI_MODEL_PREFIXES, "s.session_type = 'cli'", None),
+        # Ownership moves the provider too: these are Anthropic's, whichever
+        # credential route OpenClaw used. Matches the pre-existing anthropic/*
+        # rows so the dashboard shows one provider, not two.
+        (OC_CLAUDE_PREFIXES, "s.session_type != 'cli'", "anthropic"),
     ):
-        item = grouped.setdefault(
-            row[0],
-            {"sources": set(), "types": set(), "channels": set(), "labels": set()},
-        )
-        source = row[1]
-        if source:
-            item["sources"].add("openclaw" if source == "gui" else source)
-        if row[2]:
-            item["types"].add(row[2])
-        if row[3]:
-            item["channels"].add(row[3])
-        if row[4]:
-            item["labels"].add(row[4])
+        sess_filter = owned_sql.replace("s.session_type", "session_type")
+        for old_prefix, new_prefix in table.items():
+            pairs = cur.execute(
+                f"""
+                SELECT DISTINCT mr.id, mr.model_raw, mr.endpoint, mr.author,
+                       mr.model, mr.pru_multiplier
+                FROM messages m
+                JOIN model_reference mr ON mr.id = m.model_ref_id
+                JOIN sessions s ON s.session_id = m.session_id
+                WHERE mr.model_raw LIKE ? AND {owned_sql}
+                """,
+                (old_prefix + "%",),
+            ).fetchall()
+            for old_id, old_raw, endpoint, author, model, pru in pairs:
+                new_raw = new_prefix + old_raw[len(old_prefix):]
+                endpoint = endpoint_override or endpoint
+                row = cur.execute(
+                    "SELECT id FROM model_reference WHERE model_raw = ?", (new_raw,)
+                ).fetchone()
+                if row:
+                    new_id = int(row[0])
+                else:
+                    cur.execute(
+                        """
+                        INSERT INTO model_reference
+                        (model_raw, endpoint, author, model, pru_multiplier)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (new_raw, endpoint, author, model, pru),
+                    )
+                    new_id = int(cur.lastrowid)
+                cur.execute(
+                    f"""
+                    UPDATE messages SET model_ref_id = ?
+                    WHERE model_ref_id = ?
+                      AND session_id IN (SELECT session_id FROM sessions
+                                         WHERE {sess_filter})
+                    """,
+                    (new_id, old_id),
+                )
+                moved += cur.rowcount
+                cur.execute(
+                    f"""
+                    UPDATE segments SET model_raw = ?
+                    WHERE model_raw = ?
+                      AND session_id IN (SELECT session_id FROM sessions
+                                         WHERE {sess_filter})
+                    """,
+                    (new_raw, old_raw),
+                )
+    conn.commit()
+    if moved:
+        print(f"✓ Ownership prefix: {moved} messages repointed")
+    return moved
 
-    updated = 0
-    for session_id, item in grouped.items():
-        source = (
-            next(iter(item["sources"]))
-            if len(item["sources"]) == 1
-            else "openclaw"
-        )
-        channel_type = (
-            next(iter(item["types"])) if len(item["types"]) == 1 else None
-        )
-        channel_name = (
-            next(iter(item["channels"])) if len(item["channels"]) == 1 else None
-        )
-        label = next(iter(item["labels"])) if len(item["labels"]) == 1 else None
+
+def reclassify_runtime_session_identities(conn):
+    """Separate direct CLI sessions from OpenClaw-owned runtime evidence.
+
+    `codex_cli` was an importer label, never a source provider. Codex transcripts
+    explicitly record their originator, so classify direct use as codex/* + CLI
+    and OpenClaw app-server use as openai/* + OpenClaw runtime evidence.
+    """
+    cur = conn.cursor()
+    touched = set()
+
+    cur.execute("CREATE TEMP TABLE IF NOT EXISTS direct_claude_sessions(session_id TEXT PRIMARY KEY)")
+    cur.execute("DELETE FROM direct_claude_sessions")
+    # Kimi files are direct CLI. Claude transcripts record their launcher in
+    # `entrypoint` (sdk-cli = OpenClaw wrapper), so classify them the same way
+    # Codex is classified by `originator`; never blanket-label them CLI. The
+    # channel columns are still cleared: do not mutate a runtime session into
+    # Discord.
+    for session_id, filename, session_type, channel_type, channel_id, channel_name in cur.execute(
+        """
+        SELECT session_id, filename, session_type, channel_type, channel_id, channel_name
+        FROM sessions
+        WHERE filename LIKE 'claude:%' OR filename LIKE 'kimi_code:%'
+        """
+    ).fetchall():
+        if filename.startswith("claude:"):
+            filepath = CLAUDE_PROJECTS_DIR / filename[len("claude:"):]
+            entrypoint = read_claude_entrypoint(filepath)
+            new_type = claude_session_kind(entrypoint)
+            if entrypoint == 'cli':
+                cur.execute("INSERT OR IGNORE INTO direct_claude_sessions VALUES (?)", (session_id,))
+        else:
+            new_type = "cli"
+        if (
+            session_type != new_type
+            or channel_type != new_type
+            or channel_id is not None
+            or channel_name is not None
+        ):
+            cur.execute(
+                """
+                UPDATE sessions
+                SET session_type = ?, channel_type = ?,
+                    channel_id = NULL, channel_name = NULL
+                WHERE session_id = ?
+                """,
+                (new_type, new_type, session_id),
+            )
+
+    codex_sessions = cur.execute(
+        """
+        SELECT session_id, filename, session_type, channel_type, parent_nickname
+        FROM sessions
+        WHERE filename LIKE 'codex_cli:%'
+        """
+    ).fetchall()
+    for session_id, filename, old_type, old_channel_type, old_label in codex_sessions:
+        filepath = codex_filepath_from_storage_name(filename)
+        meta = read_codex_session_meta(filepath) if filepath and filepath.exists() else {}
+        is_openclaw = codex_is_openclaw_runtime(
+            meta.get("originator"), filename.startswith("codex_cli:codex-home/"))
+        # Identity uses the proven owner; standalone execution keeps codex.
+        provider = "openai" if is_openclaw else "cli-codex"
+        endpoint = "openai" if is_openclaw else "codex"
+        ingest_source = "codex_app_server" if is_openclaw else "codex_cli"
+        new_type = "openclaw" if is_openclaw else "cli"
+        new_channel_type = "openclaw" if is_openclaw else "cli"
+        new_label = None if is_openclaw and old_label == "vscode" else old_label
+
+        if (
+            old_type != new_type
+            or old_channel_type != new_channel_type
+            or old_label != new_label
+        ):
+            cur.execute(
+                """
+                UPDATE sessions
+                SET session_type = ?, channel_type = ?, parent_nickname = ?
+                WHERE session_id = ?
+                """,
+                (new_type, new_channel_type, new_label, session_id),
+            )
+
+        rows = cur.execute(
+            """
+            SELECT model_raw FROM (
+                SELECT DISTINCT mr.model_raw AS model_raw
+                FROM messages m
+                JOIN model_reference mr ON mr.id = m.model_ref_id
+                WHERE m.session_id = ?
+                  AND (mr.model_raw LIKE 'codex_cli/%' OR (? = 0 AND mr.model_raw LIKE 'openai/%'))
+                UNION
+                SELECT DISTINCT seg.model_raw AS model_raw
+                FROM segments seg
+                WHERE seg.session_id = ?
+                  AND (seg.model_raw LIKE 'codex_cli/%' OR (? = 0 AND seg.model_raw LIKE 'openai/%'))
+            )
+            """,
+            (session_id, int(is_openclaw), session_id, int(is_openclaw)),
+        ).fetchall()
+        for (old_model_raw,) in rows:
+            model_name = old_model_raw.split("/", 1)[1]
+            new_model_raw = f"{provider}/{model_name}"
+            old_ref = cur.execute(
+                """
+                SELECT author, model, pru_multiplier
+                FROM model_reference
+                WHERE model_raw = ?
+                """,
+                (old_model_raw,),
+            ).fetchone()
+            existing_ref = cur.execute(
+                "SELECT id FROM model_reference WHERE model_raw = ?",
+                (new_model_raw,),
+            ).fetchone()
+            if not existing_ref and old_ref:
+                cur.execute(
+                    """
+                    INSERT INTO model_reference
+                    (model_raw, endpoint, author, model, pru_multiplier)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        new_model_raw,
+                        endpoint,
+                        old_ref[0],
+                        old_ref[1],
+                        old_ref[2],
+                    ),
+                )
+                new_model_ref_id = cur.lastrowid
+            else:
+                new_model_ref_id = (
+                    existing_ref[0]
+                    if existing_ref
+                    else get_model_ref_id(cur, new_model_raw)
+                )
+            cur.execute(
+                """
+                UPDATE messages
+                SET model_ref_id = ?, ingest_source = ?
+                WHERE session_id = ?
+                  AND model_ref_id = (
+                      SELECT id FROM model_reference WHERE model_raw = ?
+                  )
+                """,
+                (new_model_ref_id, ingest_source, session_id, old_model_raw),
+            )
+            cur.execute(
+                """
+                UPDATE segments
+                SET model_raw = ?
+                WHERE session_id = ? AND model_raw = ?
+                """,
+                (new_model_raw, session_id, old_model_raw),
+            )
         cur.execute(
             """
-            UPDATE sessions
-            SET session_type = ?,
-                channel_type = COALESCE(?, channel_type),
-                channel_name = COALESCE(?, channel_name),
-                parent_nickname = COALESCE(?, parent_nickname)
-            WHERE session_id = ?
-              AND filename LIKE 'claude:%'
+            UPDATE messages
+            SET ingest_source = ?
+            WHERE session_id = ? AND ingest_source IN ('codex_cli', 'codex_app_server')
+              AND ingest_source != ?
             """,
-            (source, channel_type, channel_name, label, session_id),
+            (ingest_source, session_id, ingest_source),
         )
-        updated += cur.rowcount
-    return updated
+
+    conn.commit()
+    return touched
+
+
+def cleanup_obsolete_codex_cli_model_refs(conn):
+    """Remove importer-only raw ids after every real reference has moved."""
+    cur = conn.cursor()
+    invoice_guard = ""
+    if cur.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'provider_pru_invoices'"
+    ).fetchone():
+        invoice_guard = """
+          AND NOT EXISTS (
+              SELECT 1 FROM provider_pru_invoices p WHERE p.model_raw = model_reference.model_raw
+          )
+        """
+    cur.execute(
+        f"""
+        DELETE FROM model_reference
+        WHERE model_raw LIKE 'codex_cli/%'
+          AND NOT EXISTS (
+              SELECT 1 FROM messages m WHERE m.model_ref_id = model_reference.id
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM segments seg WHERE seg.model_raw = model_reference.model_raw
+          )
+          {invoice_guard}
+        """
+    )
+    return cur.rowcount
+
+
+def add_message_attribution(
+    cur,
+    source_message_id,
+    canonical_session_id,
+    canonical_model_raw,
+    reason,
+    canonical_message_id=None,
+):
+    model_ref_id = get_model_ref_id(cur, canonical_model_raw)
+    cur.execute(
+        """
+        INSERT OR REPLACE INTO message_attributions
+        (source_message_id, canonical_session_id, canonical_model_ref_id,
+         canonical_message_id, reason)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            source_message_id,
+            canonical_session_id,
+            model_ref_id,
+            canonical_message_id,
+            reason,
+        ),
+    )
+
+
+def build_runtime_attributions(conn, routes=None):
+    """Attribute complete runtime counters to OpenClaw-owned sessions."""
+    cur = conn.cursor()
+    touched = set()
+    pending = []
+    model_ref_cache = {
+        row[0]: row[1]
+        for row in cur.execute("SELECT model_raw, id FROM model_reference")
+    }
+
+    def queue_attribution(
+        source_message_id,
+        canonical_session_id,
+        canonical_model_raw,
+        reason,
+        canonical_message_id=None,
+    ):
+        model_ref_id = model_ref_cache.get(canonical_model_raw)
+        if model_ref_id is None:
+            model_ref_id = get_model_ref_id(cur, canonical_model_raw)
+            model_ref_cache[canonical_model_raw] = model_ref_id
+        pending.append(
+            (
+                source_message_id,
+                canonical_session_id,
+                model_ref_id,
+                canonical_message_id,
+                reason,
+            )
+        )
+
+    # A proved final-call twin identifies the runtime invocation. Attribute all
+    # calls when the invocation has exactly one owner; ambiguous joins stay raw.
+    claude_targets = {}
+    for source_session, source_id, wrapper_id, wrapper_session, model_raw in cur.execute(
+        """SELECT cli.session_id, cli.id, wrapper.id, wrapper.session_id, mr.model_raw
+           FROM messages wrapper JOIN messages cli ON cli.id = wrapper.duplicate_of
+           JOIN model_reference mr ON mr.id = wrapper.model_ref_id
+           WHERE wrapper.excluded_reason = 'duplicate_claude_wrapper_cli'
+             AND wrapper.is_excluded = 1"""
+    ).fetchall():
+        claude_targets.setdefault(source_session, set()).add(wrapper_session)
+        queue_attribution(source_id, wrapper_session, model_raw,
+            "openclaw_claude_runtime_usage", wrapper_id)
+        touched.update((source_session, wrapper_session))
+    for source_session, owners in claude_targets.items():
+        kind = cur.execute("SELECT session_type FROM sessions WHERE session_id = ?",
+                           (source_session,)).fetchone()[0]
+        if len(owners) != 1 or kind == "cli":
+            continue
+        owner = next(iter(owners))
+        for source_id, raw in cur.execute(
+            """SELECT m.id, mr.model_raw FROM messages m
+               JOIN model_reference mr ON mr.id = m.model_ref_id
+               WHERE m.session_id = ? AND m.ingest_source = 'claude_cli'
+                 AND COALESCE(m.is_excluded, 0) = 0""", (source_session,)
+        ).fetchall():
+            queue_attribution(source_id, owner, "anthropic/" + raw.split("/", 1)[-1],
+                              "openclaw_claude_runtime_usage")
+
+    # A token-identical Codex pair proves the thread -> OpenClaw session join.
+    codex_targets = {}
+    for source_session_id, wrapper_session_id, model_raw in cur.execute(
+        """
+        SELECT cli.session_id, oc.session_id, oc_model.model_raw
+        FROM messages cli
+        JOIN messages oc ON oc.id = cli.duplicate_of
+        JOIN model_reference oc_model ON oc_model.id = oc.model_ref_id
+        WHERE cli.excluded_reason = 'duplicate_codex_app_server_openclaw'
+          AND cli.is_excluded = 1
+        """
+    ).fetchall():
+        codex_targets.setdefault(source_session_id, set()).add(
+            (wrapper_session_id, model_raw)
+        )
+
+    explicit_routes = routes if routes is not None else collect_openclaw_codex_thread_routes()
+    runtime_sessions = [
+        row[0]
+        for row in cur.execute(
+            """
+            SELECT DISTINCT session_id
+            FROM messages
+            WHERE ingest_source = 'codex_app_server'
+            """
+        )
+    ]
+    for source_session_id in runtime_sessions:
+        target_session_id = None
+        target_model_raw = None
+        proved = codex_targets.get(source_session_id, set())
+        route = explicit_routes.get(source_session_id)
+        if len(proved) == 1:
+            target_session_id, target_model_raw = next(iter(proved))
+        elif route and cur.execute(
+            "SELECT 1 FROM sessions WHERE session_id = ?",
+            (route["session_id"],),
+        ).fetchone():
+            target_session_id = route["session_id"]
+
+        if not target_session_id:
+            continue
+
+        rows = cur.execute(
+            """
+            SELECT m.id, mr.model_raw
+            FROM messages m
+            JOIN model_reference mr ON mr.id = m.model_ref_id
+            WHERE m.session_id = ?
+              AND m.ingest_source = 'codex_app_server'
+              AND COALESCE(m.is_excluded, 0) = 0
+            """,
+            (source_session_id,),
+        ).fetchall()
+        for source_id, runtime_model_raw in rows:
+            model_raw = (
+                codex_route_model_raw(route, runtime_model_raw)
+                if route
+                else target_model_raw or runtime_model_raw
+            )
+            queue_attribution(
+                source_id,
+                target_session_id,
+                model_raw,
+                "openclaw_codex_runtime_usage",
+            )
+        if rows:
+            touched.update((source_session_id, target_session_id))
+
+    cur.executemany(
+        """
+        INSERT OR REPLACE INTO message_attributions
+        (source_message_id, canonical_session_id, canonical_model_ref_id,
+         canonical_message_id, reason)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        pending,
+    )
+
+    return touched
+
+
+SUPERSEDED_BY_CODEX_RUNTIME_REASON = "superseded_by_codex_runtime_usage"
+
+
+def supersede_routed_openclaw_turn_rows(cur, routes):
+    """Exclude OpenClaw per-turn Codex rows whose turn is covered by per-call rollout rows.
+
+    The Codex harness hands OpenClaw one usage record per turn: the sum of every
+    model call in the turn (older app-server builds reported something else
+    entirely). The rollout carries one token_count per call. For a thread routed
+    by idempotency key, the attributed per-call rows are the accounting record and
+    the turn row is redundant. A turn row is excluded only when at least one
+    attributed call falls in its window (after the previous turn row of the same
+    thread, up to the turn row itself), so a rollout that is not ingested yet
+    leaves the turn row counted until the next refresh recomputes this.
+    """
+    superseded = []
+    for thread_id, route in routes.items():
+        message_ids = sorted(route.get("message_ids") or ())
+        if not message_ids:
+            continue
+        calls = [
+            row[0]
+            for row in cur.execute(
+                """
+                SELECT m.timestamp
+                FROM messages m
+                JOIN message_attributions a ON a.source_message_id = m.id
+                WHERE m.session_id = ?
+                  AND a.reason = 'openclaw_codex_runtime_usage'
+                  AND COALESCE(m.is_excluded, 0) = 0
+                  AND m.timestamp IS NOT NULL
+                ORDER BY m.timestamp
+                """,
+                (thread_id,),
+            )
+        ]
+        if not calls:
+            continue
+        turns = []
+        for start in range(0, len(message_ids), 500):
+            chunk = message_ids[start:start + 500]
+            turns.extend(
+                cur.execute(
+                    f"""
+                    SELECT id, timestamp
+                    FROM messages
+                    WHERE id IN ({",".join("?" * len(chunk))})
+                      AND ingest_source LIKE 'openclaw%'
+                      AND COALESCE(is_excluded, 0) = 0
+                      AND timestamp IS NOT NULL
+                    """,
+                    chunk,
+                ).fetchall()
+            )
+        turns.sort(key=lambda row: (row[1], row[0]))
+        call_index = 0
+        for turn_id, turn_ts in turns:
+            covered = 0
+            while call_index < len(calls) and calls[call_index] <= turn_ts:
+                covered += 1
+                call_index += 1
+            if covered:
+                superseded.append((turn_id,))
+    cur.executemany(
+        """
+        UPDATE messages
+        SET is_excluded = 1,
+            excluded_reason = ?,
+            duplicate_of = NULL
+        WHERE id = ?
+        """,
+        [(SUPERSEDED_BY_CODEX_RUNTIME_REASON, turn_id) for (turn_id,) in superseded],
+    )
+    return len(superseded)
+
+
+CLAUDE_TURN_REASON = "superseded_by_claude_runtime_usage"
+
+
+def reconcile_claude_turn_usage(conn, since):
+    """Replace a uniquely proved whole-turn sum with its original model calls.
+
+    All four counters must match exactly. A nearby final call anchors a
+    contiguous suffix in one non-terminal runtime session of the same model.
+    Ambiguous matches and overlapping claims stay on wrapper usage.
+    """
+    cur = conn.cursor()
+    fields = ("input_tokens", "output_tokens", "cache_read", "cache_write")
+    wrappers = cur.execute("""
+        SELECT m.id, m.session_id, mr.model_raw, m.timestamp,
+               m.input_tokens, m.output_tokens, m.cache_read, m.cache_write
+        FROM messages m JOIN model_reference mr ON mr.id=m.model_ref_id
+        WHERE m.ingest_source LIKE 'openclaw%' AND m.timestamp >= ?
+          AND COALESCE(m.is_excluded,0)=0
+          AND substr(mr.model_raw,1,instr(mr.model_raw,'/')-1)
+              IN ('anthropic','anthropic-c','claude-cli')
+          AND m.total_tokens > 0
+        ORDER BY m.timestamp, m.id
+    """, (since,)).fetchall()
+    claims = []
+    for wid, owner, raw, timestamp, *target in wrappers:
+        target = [v or 0 for v in target]
+        # The indexed timestamp join keeps the full-history refresh bounded.
+        finals = cur.execute("""
+            SELECT m.id, m.session_id, m.timestamp
+            FROM messages m JOIN model_reference mr ON mr.id=m.model_ref_id
+            WHERE m.timestamp >= strftime('%Y-%m-%dT%H:%M:%fZ', ?, '-2 seconds')
+              AND m.timestamp <= strftime('%Y-%m-%dT%H:%M:%fZ', ?, '+2 seconds')
+              AND m.ingest_source='claude_cli' AND COALESCE(m.is_excluded,0)=0
+              AND m.session_id NOT IN (SELECT session_id FROM direct_claude_sessions)
+              AND substr(mr.model_raw,instr(mr.model_raw,'/')+1)=?
+        """, (timestamp, timestamp, raw.split('/',1)[1])).fetchall()
+        hits = []
+        for final_id, runtime, final_ts in finals:
+            calls = cur.execute("""
+                SELECT m.id, m.input_tokens, m.output_tokens, m.cache_read, m.cache_write
+                FROM messages m JOIN model_reference mr ON mr.id=m.model_ref_id
+                WHERE m.session_id=? AND m.ingest_source='claude_cli'
+                  AND COALESCE(m.is_excluded,0)=0 AND m.timestamp <= ?
+                  AND substr(mr.model_raw,instr(mr.model_raw,'/')+1)=?
+                ORDER BY m.timestamp DESC, m.id DESC
+            """, (runtime, final_ts, raw.split('/',1)[1]))
+            sums = [0]*len(fields)
+            ids = []
+            for cid, *usage in calls:
+                if not ids and cid != final_id:
+                    break  # equal timestamps cannot prove a unique suffix
+                ids.append(cid)
+                sums = [a+(b or 0) for a,b in zip(sums,usage)]
+                if sums == target:
+                    hits.append(ids)
+                    break
+                if any(a>b for a,b in zip(sums,target)):
+                    break
+        if len(hits)==1:
+            claims.append((wid, owner, raw, hits[0]))
+    counts = {}
+    for _,_,_,ids in claims:
+        for cid in ids:
+            counts[cid] = counts.get(cid,0)+1
+    for wid,owner,raw,ids in claims:
+        if any(counts[cid]!=1 for cid in ids):
+            continue
+        cur.execute("""UPDATE messages SET is_excluded=1,excluded_reason=?,duplicate_of=NULL
+                       WHERE id=?""", (CLAUDE_TURN_REASON,wid))
+        for cid in ids:
+            add_message_attribution(cur,cid,owner,raw,"openclaw_claude_runtime_usage",wid)
 
 
 def reconcile_usage_duplicates(conn, since="2026-07-01T00:00:00"):
@@ -1774,20 +2620,84 @@ def reconcile_usage_duplicates(conn, since="2026-07-01T00:00:00"):
     totals omit rows marked here and retain a pointer to the canonical row.
     """
     cur = conn.cursor()
+    previous_duplicates = {
+        row[0]: (row[1], row[2], row[3])
+        for row in cur.execute(
+            """
+            SELECT id, session_id, duplicate_of, excluded_reason
+            FROM messages
+            WHERE excluded_reason IN (
+                'duplicate_codex_app_server_openclaw',
+                'duplicate_claude_wrapper_cli',
+                'superseded_by_codex_runtime_usage',
+                'superseded_by_claude_runtime_usage'
+            )
+            """
+        )
+    }
+    previous_attributions = {
+        row[0]: (row[1], row[2], row[3], row[4])
+        for row in cur.execute(
+            """
+            SELECT a.source_message_id, m.session_id, a.canonical_session_id,
+                   a.canonical_model_ref_id, a.reason
+            FROM message_attributions a
+            JOIN messages m ON m.id = a.source_message_id
+            WHERE a.reason IN (
+                'openclaw_codex_runtime_usage',
+                'openclaw_claude_runtime_usage',
+                'openclaw_session_owner'
+            )
+            """
+        )
+    }
+    backfill_cli_model_prefixes(conn)
+    touched_sessions = reclassify_runtime_session_identities(conn)
+    cur.execute("""UPDATE messages SET is_excluded=0,excluded_reason=NULL,duplicate_of=NULL
+        WHERE ingest_source='codex_cli' AND excluded_reason='duplicate_codex_app_server_openclaw'""")
+    cur.execute("""UPDATE messages SET is_excluded=0,excluded_reason=NULL,duplicate_of=NULL
+        WHERE excluded_reason='duplicate_claude_wrapper_cli'
+          AND duplicate_of IN (SELECT r.id FROM messages r
+              JOIN direct_claude_sessions d ON d.session_id=r.session_id)""")
+    cur.execute("UPDATE messages SET is_excluded=0,excluded_reason=NULL,duplicate_of=NULL WHERE excluded_reason=?", (CLAUDE_TURN_REASON,))
     reasons = (
+        CLAUDE_TURN_REASON,
         "duplicate_codex_app_server_openclaw",
         "duplicate_claude_wrapper_cli",
+        SUPERSEDED_BY_CODEX_RUNTIME_REASON,
     )
-    placeholders = ",".join("?" for _ in reasons)
+    # Threads joined by idempotency key are accounted per rollout call. Their
+    # earlier twin/turn exclusions are cleared here and recomputed below.
+    all_routes = collect_openclaw_codex_thread_routes(include_unrouted=True)
+    routes = {
+        thread_id: route
+        for thread_id, route in all_routes.items()
+        if route["session_id"]
+    }
     cur.execute(
-        f"""
-        UPDATE messages
-        SET duplicate_of = NULL, excluded_reason = NULL, is_excluded = 0
-        WHERE excluded_reason IN ({placeholders})
-        """,
-        reasons,
+        "CREATE TEMP TABLE IF NOT EXISTS routed_codex_threads (thread_id TEXT PRIMARY KEY)"
     )
-
+    cur.execute("DELETE FROM routed_codex_threads")
+    cur.executemany(
+        "INSERT INTO routed_codex_threads (thread_id) VALUES (?)",
+        [(thread_id,) for thread_id in routes],
+    )
+    cur.execute(
+        """
+        UPDATE messages
+        SET is_excluded = 0, excluded_reason = NULL, duplicate_of = NULL
+        WHERE excluded_reason = ?
+           OR (
+                excluded_reason = 'duplicate_codex_app_server_openclaw'
+                AND session_id IN (SELECT thread_id FROM routed_codex_threads)
+           )
+        """,
+        (SUPERSEDED_BY_CODEX_RUNTIME_REASON,),
+    )
+    attribution_reasons = (
+        "openclaw_codex_runtime_usage",
+        "openclaw_claude_runtime_usage",
+    )
     cur.execute(
         """
         WITH candidates AS (
@@ -1797,8 +2707,9 @@ def reconcile_usage_duplicates(conn, since="2026-07-01T00:00:00"):
                 ABS((julianday(cli.timestamp) - julianday(oc.timestamp)) * 86400) AS time_gap
             FROM messages cli
             JOIN model_reference cli_model ON cli_model.id = cli.model_ref_id
-            JOIN messages oc
-              ON oc.timestamp >= ?
+            JOIN messages oc INDEXED BY idx_messages_timestamp
+              ON oc.timestamp >= max(?, strftime('%Y-%m-%dT%H:%M:%fZ', cli.timestamp, '-3 seconds'))
+             AND oc.timestamp <= strftime('%Y-%m-%dT%H:%M:%fZ', cli.timestamp, '+3 seconds')
              AND ABS((julianday(cli.timestamp) - julianday(oc.timestamp)) * 86400) < 2
              AND COALESCE(cli.input_tokens, 0) = COALESCE(oc.input_tokens, 0)
              AND COALESCE(cli.output_tokens, 0) = COALESCE(oc.output_tokens, 0)
@@ -1807,11 +2718,21 @@ def reconcile_usage_duplicates(conn, since="2026-07-01T00:00:00"):
              AND COALESCE(cli.total_tokens, 0) = COALESCE(oc.total_tokens, 0)
             JOIN model_reference oc_model ON oc_model.id = oc.model_ref_id
             WHERE cli.ingest_source = 'codex_app_server'
+              AND cli.session_id NOT IN (SELECT thread_id FROM routed_codex_threads)
               AND cli.timestamp >= ?
+              AND COALESCE(cli.is_excluded, 0) = 0
+              AND NOT EXISTS (
+                  SELECT 1 FROM message_attributions a
+                  WHERE a.source_message_id = cli.id
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM messages proved
+                  WHERE proved.session_id = cli.session_id
+                    AND proved.excluded_reason = 'duplicate_codex_app_server_openclaw'
+              )
               AND oc.ingest_source LIKE 'openclaw%'
-              AND cli_model.model_raw LIKE 'codex_cli/%'
-              AND oc_model.model_raw =
-                  'openai/' || substr(cli_model.model_raw, length('codex_cli/') + 1)
+              AND cli_model.model_raw LIKE 'openai/%'
+              AND oc_model.model_raw = cli_model.model_raw
         ),
         ranked AS (
             SELECT
@@ -1827,20 +2748,17 @@ def reconcile_usage_duplicates(conn, since="2026-07-01T00:00:00"):
                 ) AS canonical_rank
             FROM candidates
         ),
-        matches AS (
+        matches AS MATERIALIZED (
             SELECT duplicate_id, canonical_id
             FROM ranked
             WHERE duplicate_rank = 1 AND canonical_rank = 1
         )
         UPDATE messages
-        SET duplicate_of = (
-                SELECT canonical_id
-                FROM matches
-                WHERE duplicate_id = messages.id
-            ),
+        SET duplicate_of = matches.canonical_id,
             excluded_reason = 'duplicate_codex_app_server_openclaw',
             is_excluded = 1
-        WHERE id IN (SELECT duplicate_id FROM matches)
+        FROM matches
+        WHERE messages.id = matches.duplicate_id
         """,
         (since, since),
     )
@@ -1864,15 +2782,25 @@ def reconcile_usage_duplicates(conn, since="2026-07-01T00:00:00"):
             FROM messages oc
             JOIN model_reference oc_model ON oc_model.id = oc.model_ref_id
             JOIN messages cli
-              ON cli.timestamp >= ?
+              ON cli.timestamp >= max(?, strftime('%Y-%m-%dT%H:%M:%fZ', oc.timestamp, '-3 seconds'))
+             AND cli.timestamp <= strftime('%Y-%m-%dT%H:%M:%fZ', oc.timestamp, '+3 seconds')
              AND ABS((julianday(cli.timestamp) - julianday(oc.timestamp)) * 86400) < 2
             JOIN model_reference cli_model ON cli_model.id = cli.model_ref_id
             WHERE oc.ingest_source LIKE 'openclaw%'
               AND oc.timestamp >= ?
+              AND COALESCE(oc.is_excluded, 0) = 0
               AND cli.ingest_source = 'claude_cli'
-              AND oc_model.model_raw LIKE 'claude-cli/%'
-              AND cli_model.model_raw =
-                  'claude/' || substr(oc_model.model_raw, length('claude-cli/') + 1)
+              AND cli.session_id NOT IN (SELECT session_id FROM direct_claude_sessions)
+              -- Both sides were renamed by the ownership convention: the OpenClaw wrapper's counters are now
+              -- anthropic/X, the Claude CLI importer's are cli-claude/X. They
+              -- still describe one Anthropic call, so they still pair here.
+              AND substr(oc_model.model_raw, 1, instr(oc_model.model_raw, '/') - 1)
+                    IN ('anthropic', 'claude-cli', 'anthropic-c')
+              AND substr(cli_model.model_raw, instr(cli_model.model_raw, '/') + 1) =
+                  substr(oc_model.model_raw, instr(oc_model.model_raw, '/') + 1)
+              AND COALESCE(cli.input_tokens, 0) = COALESCE(oc.input_tokens, 0)
+              AND COALESCE(cli.cache_read, 0) = COALESCE(oc.cache_read, 0)
+              AND COALESCE(cli.cache_write, 0) = COALESCE(oc.cache_write, 0)
               AND (
                     COALESCE(oc.input_tokens, 0) +
                     COALESCE(oc.output_tokens, 0) +
@@ -1911,51 +2839,91 @@ def reconcile_usage_duplicates(conn, since="2026-07-01T00:00:00"):
                 ) AS canonical_rank
             FROM candidates
         ),
-        matches AS (
+        matches AS MATERIALIZED (
             SELECT duplicate_id, canonical_id
             FROM ranked
             WHERE duplicate_rank = 1 AND canonical_rank = 1
         )
         UPDATE messages
-        SET duplicate_of = (
-                SELECT canonical_id
-                FROM matches
-                WHERE duplicate_id = messages.id
-            ),
+        SET duplicate_of = matches.canonical_id,
             excluded_reason = 'duplicate_claude_wrapper_cli',
             is_excluded = 1
-        WHERE id IN (SELECT duplicate_id FROM matches)
+        FROM matches
+        WHERE messages.id = matches.duplicate_id
         """,
         (since, since),
     )
 
+    cur.execute(
+        "DELETE FROM message_attributions WHERE reason IN (?, ?)",
+        attribution_reasons,
+    )
+    build_runtime_attributions(conn, routes)
+    reconcile_claude_turn_usage(conn, since)
+    # Threads mirrored into two OpenClaw sessions are not routed, but their
+    # per-call rows can still be attributed through a proved twin; the turn
+    # rows are identified by message id either way.
+    supersede_routed_openclaw_turn_rows(cur, all_routes)
     rows = cur.execute(
         """
         SELECT excluded_reason, COUNT(*), COALESCE(SUM(total_tokens), 0)
         FROM messages
         WHERE is_excluded = 1
-          AND excluded_reason IN (?, ?)
+          AND excluded_reason IN (?, ?, ?, ?)
         GROUP BY excluded_reason
         ORDER BY excluded_reason
         """,
         reasons,
     ).fetchall()
-    touched_sessions = {
-        row[0]
+    current_duplicates = {
+        row[0]: (row[1], row[2], row[3])
         for row in cur.execute(
             """
-            SELECT DISTINCT session_id
+            SELECT id, session_id, duplicate_of, excluded_reason
             FROM messages
-            WHERE is_excluded = 1
-              AND excluded_reason IN (?, ?)
-              AND session_id IS NOT NULL
+            WHERE excluded_reason IN (?, ?, ?, ?)
             """,
             reasons,
         )
     }
+    current_attributions = {
+        row[0]: (row[1], row[2], row[3], row[4])
+        for row in cur.execute(
+            """
+            SELECT a.source_message_id, m.session_id, a.canonical_session_id,
+                   a.canonical_model_ref_id, a.reason
+            FROM message_attributions a
+            JOIN messages m ON m.id = a.source_message_id
+            WHERE a.reason IN (?, ?)
+            """,
+            attribution_reasons,
+        )
+    }
+    for message_id in set(previous_duplicates) | set(current_duplicates):
+        before = previous_duplicates.get(message_id)
+        after = current_duplicates.get(message_id)
+        if before == after:
+            continue
+        for value in (before, after):
+            if value and value[0]:
+                touched_sessions.add(value[0])
+    for message_id in set(previous_attributions) | set(current_attributions):
+        before = previous_attributions.get(message_id)
+        after = current_attributions.get(message_id)
+        if before == after:
+            continue
+        for value in (before, after):
+            if not value:
+                continue
+            source_session_id, canonical_session_id = value[0], value[1]
+            if source_session_id:
+                touched_sessions.add(source_session_id)
+            if canonical_session_id:
+                touched_sessions.add(canonical_session_id)
+    touched_sessions.update(reconcile_session_owners(conn))
     for session_id in touched_sessions:
         recompute_segments(conn, session_id)
-    propagate_claude_wrapper_provenance(conn)
+    removed_model_refs = cleanup_obsolete_codex_cli_model_refs(conn)
     conn.commit()
 
     summary = {reason: {"calls": 0, "tokens": 0} for reason in reasons}
@@ -1964,8 +2932,13 @@ def reconcile_usage_duplicates(conn, since="2026-07-01T00:00:00"):
     print(
         "✓ Reconciled duplicates: "
         f"{summary['duplicate_codex_app_server_openclaw']['calls']} Codex, "
-        f"{summary['duplicate_claude_wrapper_cli']['calls']} Claude wrapper"
+        f"{summary['duplicate_claude_wrapper_cli']['calls']} Claude wrapper, "
+        f"{summary[CLAUDE_TURN_REASON]['calls']} Claude turn rows, "
+        f"{summary[SUPERSEDED_BY_CODEX_RUNTIME_REASON]['calls']} Codex turn rows "
+        "superseded by per-call usage"
     )
+    if removed_model_refs:
+        print(f"✓ Removed {removed_model_refs} obsolete codex_cli model references")
     return touched_sessions, summary
 
 def extract_channel_info(user_text):
@@ -2409,6 +3382,121 @@ def _openclaw_sqlite_session_metadata(row):
     }
 
 
+def collect_scheduled_owner_keys():
+    """Read supported scheduler output, not credential-bearing config files."""
+    owners = {}
+    try:
+        result = subprocess.run(["openclaw", "cron", "list", "--all", "--json"],
+                                capture_output=True, text=True, timeout=20, check=True)
+        payload = json.loads(result.stdout)
+        if payload.get("hasMore"):
+            raise ValueError("scheduler list is incomplete")
+        for job in payload.get("jobs", []):
+            policy = job.get("scheduledToolPolicy") or {}
+            key = policy.get("ownerSessionKey") or (job.get("owner") or {}).get("sessionKey")
+            if key and job.get("sessionTarget") == "current":
+                owners[job["id"]] = key
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        print(f"WARNING: scheduled owner discovery unavailable: {type(exc).__name__}")
+    return owners
+
+
+def reconcile_session_owners(conn, scheduled_owners=None):
+    """Collapse explicit continuations and current-target automation evidence."""
+    owners = collect_scheduled_owner_keys() if scheduled_owners is None else scheduled_owners
+    cur = conn.cursor()
+    existing = {r[0] for r in cur.execute("SELECT session_id FROM sessions")}
+    # Retain proved historical ownership if a job is retired or discovery fails.
+    routes = dict(cur.execute("""SELECT m.session_id, MIN(a.canonical_session_id)
+        FROM message_attributions a JOIN messages m ON m.id=a.source_message_id
+        WHERE a.reason='openclaw_session_owner' AND m.ingest_source LIKE 'openclaw%'
+          AND a.canonical_session_id != m.session_id
+        GROUP BY m.session_id HAVING COUNT(DISTINCT a.canonical_session_id)=1"""))
+    touched = set()
+    for source in collect_openclaw_sqlite_sources():
+        db = openclaw_source_connection(source['path'])
+        db.row_factory = sqlite3.Row
+        try:
+            nodes = {r["session_key"]: r for r in db.execute(
+                "SELECT session_key, current_session_id, entry_json, created_at, label, display_name FROM session_nodes")}
+            windows = db.execute("SELECT session_id, session_key, previous_session_id FROM session_windows").fetchall()
+            try:
+                archived = db.execute("SELECT DISTINCT session_id, session_key, NULL AS previous_session_id FROM session_transcript_archives").fetchall()
+                live_ids = {r["session_id"] for r in windows}
+                windows.extend(r for r in archived if r["session_id"] not in live_ids)
+            except sqlite3.OperationalError:
+                pass
+            by_id = {r["session_id"]: r for r in windows}
+            for window in windows:
+                sid, key = window["session_id"], window["session_key"]
+                if sid not in existing:
+                    continue
+                node = nodes.get(key)
+                # Restore historical source metadata without replaying counters.
+                metadata_row = dict(node) if node else dict(session_key=key, entry_json='{}',
+                    created_at=None, label=None, display_name=None)
+                meta = _openclaw_sqlite_session_metadata(metadata_row)
+                cur.execute("""UPDATE sessions SET session_type=?, channel_type=?,
+                    channel_id=COALESCE(?,channel_id), channel_name=COALESCE(?,channel_name),
+                    parent_nickname=COALESCE(?,parent_nickname)
+                    WHERE session_id=? AND filename NOT LIKE 'claude:%'
+                      AND filename NOT LIKE 'codex_cli:%'""",
+                    (meta['session_type'],meta['channel_type'],meta['channel_id'],
+                     meta['channel_name'],meta['parent_nickname'],sid))
+                match = re.search(r":cron:([^:]+)", key)
+                owner_key = owners.get(match.group(1)) if match else None
+                target_node = nodes.get(owner_key) if owner_key else None
+                if target_node and target_node["current_session_id"] in existing:
+                    routes.setdefault(sid, target_node["current_session_id"])
+                # Explicit previous-session edges only: no matching-name merges.
+                previous = window["previous_session_id"]
+                if previous in existing and previous in by_id and by_id[previous]["session_key"] == key:
+                    routes[previous] = sid
+        except sqlite3.OperationalError:
+            pass  # old source stores without durable windows
+        finally:
+            db.close()
+    def resolve(sid):
+        seen = set()
+        while sid in routes and sid not in seen:
+            seen.add(sid)
+            sid = routes[sid]
+        return None if sid in seen else sid
+    cur.execute("""UPDATE message_attributions SET reason='session_model_identity'
+        WHERE reason='openclaw_session_owner' AND canonical_session_id=
+              (SELECT session_id FROM messages WHERE id=source_message_id)""")
+    for mid, sid, raw, kind in cur.execute(
+        """SELECT m.id,m.session_id,mr.model_raw,s.session_type FROM messages m
+           JOIN sessions s ON s.session_id=m.session_id
+           JOIN model_reference mr ON mr.id=m.model_ref_id
+           WHERE mr.model_raw LIKE 'anthropic-c/%'
+             AND COALESCE(m.is_excluded,0)=0"""
+    ).fetchall():
+        model_id = get_model_ref_id(cur, ("cli-claude/" if kind == "cli" else "anthropic/") + raw.split("/",1)[1])
+        cur.execute("""INSERT INTO message_attributions
+            (source_message_id,canonical_session_id,canonical_model_ref_id,reason)
+            VALUES (?,?,?,'session_model_identity')
+            ON CONFLICT(source_message_id) DO UPDATE SET canonical_model_ref_id=excluded.canonical_model_ref_id""",
+            (mid,sid,model_id))
+        touched.add(sid)
+    # Persist owner routes in the existing attribution relation; raw logs stay put.
+    for source_sid in routes:
+        owner = resolve(source_sid)
+        if not owner or owner == source_sid:
+            continue
+        for mid, model_id in cur.execute(
+            "SELECT id, model_ref_id FROM messages WHERE session_id=? AND ingest_source LIKE 'openclaw%'",
+            (source_sid,)).fetchall():
+            cur.execute("""INSERT OR REPLACE INTO message_attributions
+                (source_message_id,canonical_session_id,canonical_model_ref_id,reason)
+                VALUES (?,?,?,'openclaw_session_owner')""", (mid,owner,model_id))
+        # Runtime attributions may point to one of those wrapper sessions.
+        cur.execute("UPDATE message_attributions SET canonical_session_id=? WHERE canonical_session_id=?",
+                    (owner,source_sid))
+        touched.update((source_sid,owner))
+    return touched
+
+
 def ingest_openclaw_sqlite(conn):
     """Incrementally import usage-bearing assistant events from OpenClaw SQLite.
 
@@ -2428,9 +3516,26 @@ def ingest_openclaw_sqlite(conn):
         state = get_ingest_state(tracker_cur, storage_name)
         last_rowid = int(state.get("last_offset") or 0) if state else 0
 
-        source_conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        source_conn = openclaw_source_connection(db_path)
         source_conn.row_factory = sqlite3.Row
         try:
+            # OpenClaw may rebuild/compact its SQLite store.  In that case the
+            # rowid cursor from the previous store can be greater than the
+            # current maximum rowid, causing every newly written event to be
+            # skipped forever.  Rewind only this source; message ids and
+            # INSERT OR REPLACE make the replay idempotent.
+            current_max_rowid = int(
+                source_conn.execute(
+                    "SELECT COALESCE(MAX(rowid), 0) FROM transcript_events"
+                ).fetchone()[0]
+            )
+            if last_rowid > current_max_rowid:
+                print(
+                    f"  SQLite rowid regression for {agent_id}: "
+                    f"cursor {last_rowid} > max {current_max_rowid}; rewinding"
+                )
+                last_rowid = 0
+
             node_metadata = {}
             for node in source_conn.execute(
                 """
@@ -2442,6 +3547,81 @@ def ingest_openclaw_sqlite(conn):
                 if node["current_session_id"]:
                     node_metadata[node["current_session_id"]] = _openclaw_sqlite_session_metadata(node)
 
+            # Reset generations are durable transcript events even though the
+            # owner session id is intentionally sticky.  Scan them on every
+            # refresh so databases created before this table existed are
+            # backfilled without rewinding the usage-event ingest cursor.
+            reset_rows = source_conn.execute(
+                """
+                SELECT session_id, seq, event_json
+                FROM transcript_events
+                WHERE json_extract(event_json, '$.type') = 'reset'
+                ORDER BY session_id, seq
+                """
+            ).fetchall()
+            for reset_row in reset_rows:
+                try:
+                    reset_event = json.loads(reset_row["event_json"])
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                reset_ts = reset_event.get("timestamp")
+                if not reset_ts:
+                    continue
+                reset_session_id = reset_row["session_id"]
+                exists = tracker_cur.execute(
+                    """
+                    SELECT 1 FROM session_boundaries
+                    WHERE session_id = ? AND source = ? AND event_seq = ?
+                    """,
+                    (reset_session_id, agent_id, reset_row["seq"]),
+                ).fetchone()
+                if exists:
+                    continue
+                if not tracker_cur.execute(
+                    "SELECT 1 FROM sessions WHERE session_id = ?",
+                    (reset_session_id,),
+                ).fetchone():
+                    metadata = node_metadata.get(reset_session_id, {})
+                    reset_nickname = (
+                        reset_session_id[9:13]
+                        if reset_session_id and len(reset_session_id) >= 13
+                        else reset_session_id
+                    )
+                    tracker_cur.execute(
+                        """
+                        INSERT OR IGNORE INTO sessions
+                        (session_id, session_nickname, parent_nickname, filename, created_at,
+                         channel_id, channel_name, channel_type, session_type, deleted_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                        """,
+                        (
+                            reset_session_id,
+                            reset_nickname,
+                            metadata.get("parent_nickname"),
+                            storage_name,
+                            metadata.get("created_at") or reset_ts,
+                            metadata.get("channel_id"),
+                            metadata.get("channel_name"),
+                            metadata.get("channel_type") or "gui",
+                            metadata.get("session_type") or "gui",
+                        ),
+                    )
+                tracker_cur.execute(
+                    """
+                    INSERT INTO session_boundaries
+                    (session_id, source, event_seq, timestamp, reason)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        reset_session_id,
+                        agent_id,
+                        reset_row["seq"],
+                        reset_ts,
+                        reset_event.get("reason"),
+                    ),
+                )
+                touched_session_ids.add(reset_session_id)
+
             rows = source_conn.execute(
                 """
                 SELECT rowid, session_id, seq, event_json, created_at
@@ -2452,6 +3632,10 @@ def ingest_openclaw_sqlite(conn):
                 (last_rowid,),
             ).fetchall()
             if not rows:
+                for session_id in touched_session_ids:
+                    recompute_segments(conn, session_id)
+                if touched_session_ids:
+                    conn.commit()
                 continue
 
             max_rowid = last_rowid
@@ -2652,6 +3836,7 @@ def parse_claude_session_file(filepath, conn):
     created_at = None
     first_user_text = None
     cwd = None
+    entrypoint = None
     message_count = 0
     current_model_raw = None
     segment_index = 0
@@ -2703,6 +3888,7 @@ def parse_claude_session_file(filepath, conn):
 
                 session_id = session_id or data.get("sessionId")
                 cwd = cwd or data.get("cwd")
+                entrypoint = entrypoint or data.get("entrypoint")
                 ts = data.get("timestamp")
                 if ts and (created_at is None or ts < created_at):
                     created_at = ts
@@ -2723,9 +3909,12 @@ def parse_claude_session_file(filepath, conn):
                         """INSERT OR IGNORE INTO sessions
                            (session_id, session_nickname, filename, created_at, channel_type, session_type)
                            VALUES (?, ?, ?, ?, ?, ?)""",
-                        (session_id, session_nickname, storage_name, created_at, "gui", "gui")
+                        (session_id, session_nickname, storage_name, created_at,
+                         claude_session_kind(entrypoint), claude_session_kind(entrypoint))
                     )
 
+                row["model_raw"] = cli_prefixed_model_raw(
+                    row["model_raw"], claude_session_kind(entrypoint))
                 model_ref_id = get_model_ref_id(cur, row["model_raw"])
                 cur.execute("""
                     INSERT OR REPLACE INTO messages
@@ -2762,7 +3951,8 @@ def parse_claude_session_file(filepath, conn):
                  channel_id, channel_name, channel_type, session_type, deleted_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (session_id, session_nickname, label, storage_name, created_at,
-                  None, None, "gui", "gui", None))
+                  None, None, claude_session_kind(entrypoint),
+                  claude_session_kind(entrypoint), None))
             return True, message_count, session_id
     except Exception as e:
         print(f"  Error reading Claude session {filepath}: {e}")
@@ -3041,6 +4231,7 @@ def parse_codex_session_file(filepath, conn):
     cur = conn.cursor()
 
     session_id = extract_codex_session_id_from_file(filepath)
+    session_meta = read_codex_session_meta(filepath)
     # App-server rollouts under agent codex-home are the authoritative usage
     # source: OpenClaw message logs record mostly zero usage for harness turns,
     # so do NOT skip them as "already covered by OpenClaw logs". Classic
@@ -3048,6 +4239,7 @@ def parse_codex_session_file(filepath, conn):
     if (
         session_id
         and not codex_app_server_root_for(filepath)
+        and session_meta.get("originator") != "openclaw"
         and session_id in collect_openclaw_codex_thread_ids()
     ):
         return True, 0, session_id
@@ -3062,6 +4254,7 @@ def parse_codex_session_file(filepath, conn):
     segment_msgs = []
     seen_token_count_states = set()
     source_label = "codex_cli"
+    originator = None
 
     def ensure_session_stub():
         if not session_id:
@@ -3146,6 +4339,7 @@ def parse_codex_session_file(filepath, conn):
                     session_nickname = session_id[9:13] if session_id and len(session_id) >= 13 else session_id
                     created_at = payload.get("timestamp") or data.get("timestamp") or created_at
                     source_label = normalize_codex_source_label(payload.get("source") or source_label)
+                    originator = payload.get("originator") or originator
                     ensure_session_stub()
                     continue
 
@@ -3168,7 +4362,9 @@ def parse_codex_session_file(filepath, conn):
                     created_at = data.get("timestamp")
                 ensure_session_stub()
 
-                model_raw = f"codex_cli/{current_model or 'unknown'}"
+                is_openclaw_runtime = codex_is_openclaw_runtime(originator, codex_app_server_root_for(filepath))
+                provider = "openai" if is_openclaw_runtime else "cli-codex"
+                model_raw = f"{provider}/{current_model or 'unknown'}"
                 timestamp = data.get("timestamp")
                 msg_id = f"{session_id}:codex:{line_num}"
                 normalized_usage = normalize_codex_usage(last_usage)
@@ -3182,7 +4378,7 @@ def parse_codex_session_file(filepath, conn):
                     normalized_usage,
                     ingest_source=(
                         "codex_app_server"
-                        if codex_app_server_root_for(filepath)
+                        if is_openclaw_runtime
                         else "codex_cli"
                     ),
                 )
@@ -3208,6 +4404,11 @@ def parse_codex_session_file(filepath, conn):
         if insert_errors:
             print(f"  WARNING: {insert_errors} line(s) failed during parsing of {filename}")
         if session_id:
+            is_openclaw_runtime = codex_is_openclaw_runtime(originator, codex_app_server_root_for(filepath))
+            session_type = "openclaw" if is_openclaw_runtime else "cli"
+            channel_type = "openclaw" if is_openclaw_runtime else "cli"
+            if is_openclaw_runtime and source_label == "vscode":
+                source_label = None
             cur.execute(
                 """
                 INSERT OR REPLACE INTO sessions
@@ -3215,7 +4416,7 @@ def parse_codex_session_file(filepath, conn):
                  channel_id, channel_name, channel_type, session_type, deleted_at)
                 VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?, NULL)
                 """,
-                (session_id, session_nickname, source_label, filename, created_at, "gui", "codex_cli"),
+                (session_id, session_nickname, source_label, filename, created_at, channel_type, session_type),
             )
             return True, message_count, session_id
     except Exception as e:
@@ -3451,6 +4652,7 @@ def migrate_incremental(conn, include_openclaw=True, include_claude=True):
 
 
 
+
 def parse_args():
     ap = argparse.ArgumentParser(
         description="Ingest OpenClaw SQLite/JSONL and CLI usage into an AI Cost Tracker database."
@@ -3479,6 +4681,8 @@ def main():
     global CODEX_HOME_GLOB, CLAUDE_PROJECTS_DIR, KIMI_CODE_DIR, KIMI_SESSION_SOURCE
     global CHANNEL_MAPPING_PATH, BACKUPS_DIR
 
+    if sys.version_info < (3, 14):
+        raise SystemExit("Python 3.14+ is required for compressed OpenClaw transcripts.")
     args = parse_args()
     DB_PATH = Path(args.db).expanduser().resolve()
     SESSIONS_DIR = Path(args.sessions_dir).expanduser().resolve()
@@ -3542,7 +4746,6 @@ def main():
             if include_openclaw_sqlite:
                 ingest_openclaw_sqlite(conn)
             backfill_message_ingest_sources(conn)
-            normalize_model_reference_aliases(conn)
             reconcile_usage_duplicates(conn)
             backfill_cli_payg_costs(conn)
         else:
@@ -3550,7 +4753,6 @@ def main():
             if include_openclaw_sqlite:
                 touched.update(ingest_openclaw_sqlite(conn))
             backfill_message_ingest_sources(conn)
-            normalize_model_reference_aliases(conn)
             reconciled_sessions, _ = reconcile_usage_duplicates(conn)
             touched.update(reconciled_sessions)
             backfill_cli_payg_costs(conn, session_ids=touched)

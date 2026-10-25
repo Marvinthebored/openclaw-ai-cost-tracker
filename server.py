@@ -42,6 +42,8 @@ def parse_args():
     ap.add_argument('--sessions-dir', default=str(DEFAULT_SESSIONS_DIR), help='OpenClaw session log directory used by the refresh endpoint')
     ap.add_argument('--openclaw-agents-dir', default=str(DEFAULT_OPENCLAW_AGENTS_DIR), help='OpenClaw agents root containing the new per-agent SQLite stores')
     ap.add_argument('--codex-sessions-dir', default=str(DEFAULT_CODEX_SESSIONS_DIR), help='Codex CLI session log directory used by the refresh endpoint')
+    ap.add_argument('--claude-projects-dir', default=str(Path.home() / '.claude' / 'projects'))
+    ap.add_argument('--kimi-code-dir', default=str(Path.home() / '.kimi-code'))
     ap.add_argument('--channel-mapping', default=None, help='Optional JSON channel-mapping file passed through to migrate_sessions.py')
     ap.add_argument('--backups-dir', default=str(DEFAULT_BACKUPS_DIR), help='Backup directory passed through to migrate_sessions.py')
     return ap.parse_args()
@@ -142,6 +144,9 @@ class TrackerHandler(BaseHTTPRequestHandler):
         if path in ('/api/cost-v3/refresh', '/api/cost-v4/refresh'):
             self.handle_refresh()
             return
+        if path == '/api/cost-v4/log-sources':
+            self.handle_cost_v4_log_sources(parsed)
+            return
         if path.startswith('/api/cost-v4/transcript/'):
             self.handle_openclaw_transcript(unquote(path[len('/api/cost-v4/transcript/'):]))
             return
@@ -181,6 +186,18 @@ class TrackerHandler(BaseHTTPRequestHandler):
             return
         self._respond(200, viewer.read_text(encoding='utf-8'), 'text/html; charset=utf-8')
 
+    def _session_file_path(self, filename):
+        runtime = self._cost_runtime_log_path(filename)
+        if runtime:
+            path = Path(runtime)
+            return path if path.is_file() else None
+        if filename and ':' in filename and not filename.startswith('openclaw_sqlite:'):
+            agent, relative = filename.split(':', 1)
+            root = self.cfg['openclaw_agents_dir'].resolve()
+            path = (root / agent / 'sessions' / relative).resolve()
+            return path if path.is_relative_to(root) and path.is_file() else None
+        return resolve_session_log_path(filename, self.cfg['sessions_dir'], self.cfg['codex_sessions_dir'])
+
     def handle_session_log(self, session_id):
         if not session_id:
             self._respond(404, 'Session log not found\n')
@@ -207,7 +224,7 @@ class TrackerHandler(BaseHTTPRequestHandler):
             self._respond(404, 'Session log not found\n')
             return
 
-        file_path = resolve_session_log_path(filename, self.cfg['sessions_dir'], self.cfg['codex_sessions_dir'])
+        file_path = self._session_file_path(filename)
         if not file_path:
             self._respond(404, 'Session log not found\n')
             return
@@ -239,13 +256,24 @@ class TrackerHandler(BaseHTTPRequestHandler):
         agents_root = self.cfg['openclaw_agents_dir']
         for db_path in sorted(agents_root.glob('*/agent/openclaw-agent.sqlite')):
             try:
-                conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
+                import migrate_sessions as migrator
+                conn = migrator.openclaw_source_connection(db_path)
                 conn.row_factory = sqlite3.Row
                 try:
                     rows = conn.execute(
                         'SELECT event_json FROM transcript_events WHERE session_id = ? ORDER BY seq',
                         (session_id,),
                     ).fetchall()
+                    if not rows:
+                        from compression import zstd
+                        try:
+                            archive = conn.execute('SELECT encoding, archive_blob FROM session_transcript_archives WHERE session_id = ?', (session_id,)).fetchone()
+                        except sqlite3.OperationalError:
+                            archive = None
+                        if archive:
+                            blob = archive['archive_blob']
+                            text = (zstd.decompress(blob) if archive['encoding'] == 'zstd' else blob).decode('utf-8')
+                            rows = [{'event_json': line} for line in text.splitlines() if line.strip()]
                 finally:
                     conn.close()
                 if rows:
@@ -266,7 +294,7 @@ class TrackerHandler(BaseHTTPRequestHandler):
             if conn:
                 conn.close()
         filename = row['filename'] if row else None
-        file_path = resolve_session_log_path(filename, self.cfg['sessions_dir'], self.cfg['codex_sessions_dir'])
+        file_path = self._session_file_path(filename)
         if file_path:
             self._respond(200, file_path.read_bytes(), 'text/plain; charset=utf-8')
             return
@@ -285,8 +313,8 @@ class TrackerHandler(BaseHTTPRequestHandler):
             self.cfg['sessions_dir'].resolve(),
             self.cfg['codex_sessions_dir'].resolve(),
             self.cfg['openclaw_agents_dir'].resolve(),
-            (Path.home() / '.claude').resolve(),
-            (Path.home() / '.kimi-code').resolve(),
+            self.cfg['claude_projects_dir'].resolve(),
+            self.cfg['kimi_code_dir'].resolve(),
         ]
         if not any(candidate == root or candidate.is_relative_to(root) for root in allowed_roots):
             self._json(403, {'error': 'Path is outside the allowed local roots'})
@@ -413,81 +441,180 @@ class TrackerHandler(BaseHTTPRequestHandler):
         }
 
     def handle_sessions(self):
-        params = parse_qs(urlparse(self.path).query)
+        parsed = urlparse(self.path)
+        """Handle /api/cost-v4/sessions - summary rows only, no eager messages."""
+        params = parse_qs(parsed.query)
         conn = self._db()
         if not conn:
-            self._json(500, {'error': f'Database not found: {self.cfg["db"]}'})
+            self._respond(500, json.dumps({'error': 'Database not found'}), 'application/json')
             return
+
         try:
+            message_relation = self._cost_messages_relation(conn)
             start = (params.get('start') or [None])[0]
             end = (params.get('end') or [None])[0]
             usage_only = ((params.get('usage_only') or [''])[0].lower() in ('1', 'true', 'yes'))
+            has_exclusions = any(
+                row[1] == "is_excluded"
+                for row in conn.execute("PRAGMA table_info(messages)")
+            )
 
-            where = []
-            args = []
-            if start:
-                where.append("COALESCE(seg.last_msg_ts, seg.first_msg_ts) >= ?")
-                args.append(start)
-            if end:
-                where.append("COALESCE(seg.first_msg_ts, seg.last_msg_ts) <= ?")
-                args.append(end)
-            if usage_only:
-                where.append("""(
-                    COALESCE(seg.input_tokens, 0) > 0 OR
-                    COALESCE(seg.output_tokens, 0) > 0 OR
-                    COALESCE(seg.cache_read, 0) > 0 OR
-                    COALESCE(seg.cache_write, 0) > 0 OR
-                    COALESCE(seg.total_tokens, 0) > 0
-                )""")
-            where_sql = ("WHERE " + " AND ".join(where)) if where else ""
-            sessions_query = f"""
-                SELECT
-                    s.session_id,
-                    s.session_nickname,
-                    s.parent_nickname,
-                    s.created_at,
-                    s.channel_name,
-                    s.session_type,
-                    s.deleted_at,
-                    s.filename,
-                    mr.endpoint,
-                    mr.author,
-                    mr.model,
-                    mr.pru_multiplier,
-                    seg.model_raw,
-                    seg.segment_index,
-                    seg.first_msg_ts,
-                    seg.last_msg_ts,
-                    seg.msg_count,
-                    seg.input_tokens,
-                    seg.output_tokens,
-                    seg.cache_read,
-                    seg.cache_write,
-                    seg.input_tokens + seg.cache_read + seg.cache_write AS total_in,
-                    seg.total_tokens,
-                    seg.cost_input AS cost_input,
-                    seg.cost_input + seg.cost_output AS cost_io,
-                    seg.cost_cache_read + seg.cost_cache_write AS cost_cache,
-                    seg.cost_total AS cost_logged
-                FROM sessions s
-                INNER JOIN segments seg ON s.session_id = seg.session_id
-                LEFT JOIN model_reference mr ON seg.model_raw = mr.model_raw
-                {where_sql}
-                ORDER BY seg.first_msg_ts DESC
-            """
+            if start or end:
+                msg_where = (
+                    ["COALESCE(m.is_excluded, 0) = 0"]
+                    if has_exclusions
+                    else []
+                )
+                msg_args = []
+                if start:
+                    msg_where.append("m.timestamp >= ?")
+                    msg_args.append(start)
+                if end:
+                    msg_where.append("m.timestamp <= ?")
+                    msg_args.append(end)
+                if usage_only:
+                    msg_where.append("""(
+                        COALESCE(m.input_tokens, 0) > 0 OR
+                        COALESCE(m.output_tokens, 0) > 0 OR
+                        COALESCE(m.cache_read, 0) > 0 OR
+                        COALESCE(m.cache_write, 0) > 0 OR
+                        COALESCE(m.total_tokens, 0) > 0
+                    )""")
+                msg_where_sql = " AND ".join(msg_where)
+
+                query = f"""
+                    SELECT
+                        s.session_id,
+                        s.session_nickname,
+                        s.parent_nickname,
+                        s.created_at,
+                        s.channel_name,
+                        s.session_type,
+                        s.deleted_at,
+                        s.filename,
+                        mr.endpoint,
+                        mr.author,
+                        mr.model,
+                        mr.pru_multiplier,
+                        seg.model_raw,
+                        seg.segment_index,
+                        MIN(m.timestamp) AS first_msg_ts,
+                        MAX(m.timestamp) AS last_msg_ts,
+                        COUNT(m.id) AS msg_count,
+                        SUM(COALESCE(m.input_tokens, 0)) AS input_tokens,
+                        SUM(COALESCE(m.output_tokens, 0)) AS output_tokens,
+                        SUM(COALESCE(m.cache_read, 0)) AS cache_read,
+                        SUM(COALESCE(m.cache_write, 0)) AS cache_write,
+                        SUM(COALESCE(m.input_tokens, 0) + COALESCE(m.cache_read, 0) + COALESCE(m.cache_write, 0)) AS total_in,
+                        SUM(COALESCE(m.total_tokens, 0)) AS total_tokens,
+                        SUM(COALESCE(m.cost_input, 0)) AS cost_input,
+                        SUM(COALESCE(m.cost_input, 0) + COALESCE(m.cost_output, 0)) AS cost_io,
+                        SUM(COALESCE(m.cost_cache_read, 0) + COALESCE(m.cost_cache_write, 0)) AS cost_cache,
+                        SUM(COALESCE(m.cost_total, 0)) AS cost_logged
+                    FROM segments seg
+                    INNER JOIN sessions s ON s.session_id = seg.session_id
+                    LEFT JOIN model_reference mr ON seg.model_raw = mr.model_raw
+                    INNER JOIN {message_relation} m ON m.session_id = seg.session_id
+                    INNER JOIN model_reference mmr ON mmr.id = m.model_ref_id AND mmr.model_raw = seg.model_raw
+                    WHERE m.timestamp >= COALESCE(seg.first_msg_ts, s.created_at)
+                      AND m.timestamp <= COALESCE(seg.last_msg_ts, seg.first_msg_ts, s.created_at)
+                      AND {msg_where_sql}
+                    GROUP BY s.session_id, seg.model_raw, seg.segment_index
+                    HAVING COUNT(m.id) > 0
+                    ORDER BY first_msg_ts DESC
+                """
+                cursor = conn.execute(query, msg_args)
+            else:
+                segment_where_sql = ""
+                if usage_only:
+                    segment_where_sql = """
+                    WHERE (
+                        COALESCE(seg.input_tokens, 0) > 0 OR
+                        COALESCE(seg.output_tokens, 0) > 0 OR
+                        COALESCE(seg.cache_read, 0) > 0 OR
+                        COALESCE(seg.cache_write, 0) > 0 OR
+                        COALESCE(seg.total_tokens, 0) > 0
+                    )
+                    """
+                query = """
+                    SELECT
+                        s.session_id,
+                        s.session_nickname,
+                        s.parent_nickname,
+                        s.created_at,
+                        s.channel_name,
+                        s.session_type,
+                        s.deleted_at,
+                        s.filename,
+                        mr.endpoint,
+                        mr.author,
+                        mr.model,
+                        mr.pru_multiplier,
+                        seg.model_raw,
+                        seg.segment_index,
+                        seg.first_msg_ts,
+                        seg.last_msg_ts,
+                        seg.msg_count,
+                        seg.input_tokens,
+                        seg.output_tokens,
+                        seg.cache_read,
+                        seg.cache_write,
+                        seg.input_tokens + seg.cache_read + seg.cache_write as total_in,
+                        seg.total_tokens,
+                        seg.cost_input as cost_input,
+                        seg.cost_input + seg.cost_output as cost_io,
+                        seg.cost_cache_read + seg.cost_cache_write as cost_cache,
+                        seg.cost_total as cost_logged
+                    FROM sessions s
+                    INNER JOIN segments seg ON s.session_id = seg.session_id
+                    LEFT JOIN model_reference mr ON seg.model_raw = mr.model_raw
+                    {segment_where_sql}
+                    ORDER BY seg.first_msg_ts DESC
+                """.format(segment_where_sql=segment_where_sql)
+                cursor = conn.execute(query)
+
             sessions = []
-            for row in conn.execute(sessions_query, args).fetchall():
-                item = dict(row)
-                item['cost_estimated'] = row['cost_logged'] or 0
-                sessions.append(item)
+            for row in cursor.fetchall():
+                session = dict(row)
+                session['cost_estimated'] = session.get('cost_logged') or 0
+                sessions.append(session)
+
+            if parsed.path == '/api/cost-v4/sessions':
+                grouped = {}
+                totals = ('msg_count', 'input_tokens', 'output_tokens', 'cache_read',
+                          'cache_write', 'total_in', 'total_tokens', 'cost_input',
+                          'cost_io', 'cost_cache', 'cost_logged', 'cost_estimated')
+                for row in sessions:
+                    key = (row['session_id'], row['model_raw'])
+                    if key not in grouped:
+                        grouped[key] = dict(row, segment_index=-1)
+                        continue
+                    target = grouped[key]
+                    for field in totals:
+                        target[field] = (target.get(field) or 0) + (row.get(field) or 0)
+                    target['first_msg_ts'] = min(target['first_msg_ts'], row['first_msg_ts'])
+                    target['last_msg_ts'] = max(target['last_msg_ts'], row['last_msg_ts'])
+                sessions = list(grouped.values())
+                for row in sessions:
+                    prefix = row['model_raw'].split('/', 1)[0]
+                    if row['session_type'] == 'cli':
+                        filename = row.get('filename') or ''
+                        row['endpoint'] = ('codex' if filename.startswith('codex_cli:') else
+                                           'claude' if filename.startswith('claude:') else
+                                           prefix.removeprefix('cli-'))
+                    elif prefix in ('claude-cli', 'claude', 'anthropic-c'):
+                        row['endpoint'] = 'anthropic'
 
             payload = {'sessions': sessions}
             payload.update(self._metadata_payload(conn))
-            self._json(200, payload)
+            self._respond(200, json.dumps(payload), 'application/json')
+        except Exception as e:
+            self._respond(500, json.dumps({'error': str(e)}), 'application/json')
         finally:
             conn.close()
 
     def handle_messages(self, parsed):
+        """Handle /api/cost-v4/messages - lazy message drilldown for one segment."""
         params = parse_qs(parsed.query)
         session_id = (params.get('session_id') or [''])[0]
         model_raw = (params.get('model_raw') or [''])[0]
@@ -497,31 +624,32 @@ class TrackerHandler(BaseHTTPRequestHandler):
         usage_only = ((params.get('usage_only') or [''])[0].lower() in ('1', 'true', 'yes'))
 
         if not session_id or not model_raw or segment_index_raw == '':
-            self._json(400, {'error': 'Missing session_id, model_raw, or segment_index'})
+            self._respond(400, json.dumps({'error': 'Missing session_id, model_raw, or segment_index'}), 'application/json')
             return
 
         try:
             segment_index = int(segment_index_raw)
         except ValueError:
-            self._json(400, {'error': 'Invalid segment_index'})
+            self._respond(400, json.dumps({'error': 'Invalid segment_index'}), 'application/json')
             return
 
         conn = self._db()
         if not conn:
-            self._json(500, {'error': f'Database not found: {self.cfg["db"]}'})
+            self._respond(500, json.dumps({'error': 'Database not found'}), 'application/json')
             return
 
         try:
+            message_relation = self._cost_messages_relation(conn)
             seg = conn.execute(
                 """
-                SELECT first_msg_ts, last_msg_ts
+                SELECT MIN(first_msg_ts) AS first_msg_ts, MAX(last_msg_ts) AS last_msg_ts
                 FROM segments
-                WHERE session_id = ? AND model_raw = ? AND segment_index = ?
+                WHERE session_id = ? AND model_raw = ? AND (? = -1 OR segment_index = ?)
                 """,
-                (session_id, model_raw, segment_index),
+                (session_id, model_raw, segment_index, segment_index),
             ).fetchone()
-            if not seg:
-                self._json(404, {'error': 'Segment not found'})
+            if not seg or not seg['first_msg_ts']:
+                self._respond(404, json.dumps({'error': 'Segment not found'}), 'application/json')
                 return
 
             where = [
@@ -530,8 +658,11 @@ class TrackerHandler(BaseHTTPRequestHandler):
                 "m.timestamp >= ?",
                 "m.timestamp <= ?",
             ]
-            if any(row[1] == 'is_excluded' for row in conn.execute('PRAGMA table_info(messages)')):
-                where.append('COALESCE(m.is_excluded, 0) = 0')
+            if any(
+                row[1] == "is_excluded"
+                for row in conn.execute("PRAGMA table_info(messages)")
+            ):
+                where.append("COALESCE(m.is_excluded, 0) = 0")
             args = [
                 session_id,
                 model_raw,
@@ -553,7 +684,12 @@ class TrackerHandler(BaseHTTPRequestHandler):
                     COALESCE(m.total_tokens, 0) > 0
                 )""")
 
-            messages_query = f"""
+            provenance_columns = (
+                "m.source_session_id, m.source_model_ref_id, m.attribution_reason"
+                if message_relation == "effective_messages"
+                else "m.session_id AS source_session_id, m.model_ref_id AS source_model_ref_id, NULL AS attribution_reason"
+            )
+            query = f"""
                 SELECT
                     m.id, m.session_id, m.parent_id, m.timestamp,
                     CASE
@@ -562,16 +698,116 @@ class TrackerHandler(BaseHTTPRequestHandler):
                     END AS provider,
                     mr.model_raw,
                     m.input_tokens, m.output_tokens, m.cache_read, m.cache_write, m.total_tokens,
-                    m.cost_input, m.cost_output, m.cost_cache_read, m.cost_cache_write, m.cost_total
-                FROM messages m
+                    m.cost_input, m.cost_output, m.cost_cache_read, m.cost_cache_write, m.cost_total,
+                    {provenance_columns}
+                FROM {message_relation} m
                 INNER JOIN model_reference mr ON mr.id = m.model_ref_id
                 WHERE {" AND ".join(where)}
                 ORDER BY m.timestamp ASC
             """
-            messages = [dict(row) for row in conn.execute(messages_query, args).fetchall()]
-            self._json(200, {'messages': messages})
+            messages = [dict(row) for row in conn.execute(query, args).fetchall()]
+            self._respond(200, json.dumps({'messages': messages}), 'application/json')
+        except Exception as e:
+            self._respond(500, json.dumps({'error': str(e)}), 'application/json')
         finally:
             conn.close()
+
+    def _cost_messages_relation(self, conn):
+        """Use attributed message identity when the v4 schema provides it."""
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'view' AND name = 'effective_messages'"
+        ).fetchone()
+        return "effective_messages" if row else "messages"
+
+    def handle_cost_v4_log_sources(self, parsed):
+        """List runtime evidence logs attributed to one OpenClaw segment."""
+        params = parse_qs(parsed.query)
+        session_id = (params.get('session_id') or [''])[0]
+        model_raw = (params.get('model_raw') or [''])[0]
+        segment_index_raw = (params.get('segment_index') or [''])[0]
+        if not session_id or not model_raw or segment_index_raw == '':
+            self._respond(400, json.dumps({'error': 'Missing session_id, model_raw, or segment_index'}), 'application/json')
+            return
+        try:
+            segment_index = int(segment_index_raw)
+        except ValueError:
+            self._respond(400, json.dumps({'error': 'Invalid segment_index'}), 'application/json')
+            return
+
+        db_path = self.cfg["db"]
+        conn = self._db()
+        if not conn:
+            self._respond(500, json.dumps({'error': 'Database not found'}), 'application/json')
+            return
+        try:
+            has_attributions = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'message_attributions'"
+            ).fetchone()
+            if not has_attributions:
+                self._respond(200, json.dumps({'sources': []}), 'application/json')
+                return
+            seg = conn.execute(
+                """
+                SELECT MIN(first_msg_ts) AS first_msg_ts, MAX(last_msg_ts) AS last_msg_ts
+                FROM segments
+                WHERE session_id = ? AND model_raw = ? AND (? = -1 OR segment_index = ?)
+                """,
+                (session_id, model_raw, segment_index, segment_index),
+            ).fetchone()
+            if not seg or not seg['first_msg_ts']:
+                self._respond(404, json.dumps({'error': 'Segment not found'}), 'application/json')
+                return
+            rows = conn.execute(
+                """
+                SELECT src.session_id, src.filename, a.reason, MAX(m.timestamp) AS last_timestamp, COUNT(*) AS calls
+                FROM message_attributions a
+                JOIN messages m ON m.id = a.source_message_id
+                JOIN sessions src ON src.session_id = m.session_id
+                JOIN model_reference mr ON mr.id = a.canonical_model_ref_id
+                WHERE a.canonical_session_id = ?
+                  AND mr.model_raw = ?
+                  AND m.timestamp >= ?
+                  AND m.timestamp <= ?
+                GROUP BY src.session_id, src.filename, a.reason
+                ORDER BY last_timestamp DESC, src.filename
+                """,
+                (
+                    session_id,
+                    model_raw,
+                    seg['first_msg_ts'],
+                    seg['last_msg_ts'] or seg['first_msg_ts'],
+                ),
+            ).fetchall()
+            labels = {
+                'openclaw_claude_runtime_usage': 'Claude runtime usage',
+                'openclaw_codex_runtime_usage': 'Codex runtime usage',
+            }
+            sources = []
+            for row in rows:
+                path = self._cost_runtime_log_path(row['filename'])
+                if row['session_id'] == session_id:
+                    continue
+                if not path or not Path(path).is_file():
+                    if row['reason'] == 'openclaw_session_owner' or row['filename'].startswith('openclaw_sqlite:'):
+                        sources.append({'session_id': row['session_id'], 'sid': row['session_id'],
+                                        'label': 'OpenClaw continuation', 'reason': row['reason']})
+                    continue
+                sources.append({
+                    'session_id': row['session_id'],
+                    'label': labels.get(row['reason'], 'Runtime usage'),
+                    'path': path,
+                    'reason': row['reason'],
+                    'calls': row['calls'],
+                })
+            self._respond(200, json.dumps({'sources': sources}), 'application/json')
+        except Exception as e:
+            self._respond(500, json.dumps({'error': str(e)}), 'application/json')
+        finally:
+            conn.close()
+
+    def _cost_runtime_log_path(self, storage_name):
+        import migrate_sessions as migrator
+        return migrator.resolve_tracker_runtime_path(storage_name, self.cfg)
 
     def handle_refresh(self):
         cmd = [
@@ -584,6 +820,8 @@ class TrackerHandler(BaseHTTPRequestHandler):
             '--openclaw-sqlite',
             '--codex-sessions-dir', str(self.cfg['codex_sessions_dir']),
             '--backups-dir', str(self.cfg['backups_dir']),
+            '--claude-projects-dir', str(self.cfg['claude_projects_dir']),
+            '--kimi-code-dir', str(self.cfg['kimi_code_dir']),
         ]
         if self.cfg['channel_mapping']:
             cmd += ['--channel-mapping', str(self.cfg['channel_mapping'])]
@@ -641,8 +879,8 @@ class TrackerHandler(BaseHTTPRequestHandler):
             body = self.rfile.read(length) if length else b''
             data = json.loads(body.decode('utf-8') if body else '{}')
             rows = data.get('rows', [])
-            if not rows:
-                self._json(400, {'error': 'No rows provided'})
+            if 'rows' not in data or not isinstance(rows, list):
+                self._json(400, {'error': 'rows must be an explicit list'})
                 return
             if table == 'payg_model_rates':
                 self._write_payg_rates(rows)
@@ -661,29 +899,38 @@ class TrackerHandler(BaseHTTPRequestHandler):
                         (r.get('provider'), r.get('billing_start'), r.get('plan_type', 'flat'), r.get('monthly_cost'), r.get('extra_usage'), r.get('notes')),
                     )
             elif table == 'model_reference':
-                import migrate_sessions as migrator
+                # Upsert only (FK deps from messages/segments). The reference table is
+                # authoritative: accept editable aliases exactly as submitted. Best-
+                # guess values are used only for blank fields on a newly added row.
+                import migrate_sessions as _cost_ms
                 for r in rows:
-                    model_raw = r.get('model_raw') or ''
-                    inferred_endpoint, inferred_author, _model, _pru = migrator.infer_model_reference(model_raw)
-                    endpoint_in = r.get('endpoint') or inferred_endpoint or ''
-                    conn.execute(
-                        '''
+                    raw = r.get('model_raw') or ''
+                    inf_endpoint, inf_author, inf_model, _inf_pru = _cost_ms.infer_model_reference(raw)
+                    existing = conn.execute(
+                        'SELECT id FROM model_reference WHERE model_raw = ?', (raw,)
+                    ).fetchone()
+                    if existing:
+                        # Existing rows are entirely user-owned, including an
+                        # intentionally blank alias.
+                        endpoint = '' if r.get('endpoint') is None else r.get('endpoint')
+                        author = '' if r.get('author') is None else r.get('author')
+                        model = '' if r.get('model') is None else r.get('model')
+                    else:
+                        # Only a new raw identifier receives inferred defaults.
+                        endpoint = r.get('endpoint') or inf_endpoint or ''
+                        author = r.get('author') or inf_author or ''
+                        model = r.get('model') or inf_model or ''
+                    pru = r.get('pru_multiplier')
+                    if pru in (None, ''):
+                        pru = _inf_pru if not existing else None
+                    conn.execute('''
                         INSERT INTO model_reference (model_raw, endpoint, author, model, pru_multiplier)
                         VALUES (?,?,?,?,?)
                         ON CONFLICT(model_raw) DO UPDATE SET
-                            endpoint=excluded.endpoint,
-                            author=excluded.author,
-                            model=excluded.model,
-                            pru_multiplier=excluded.pru_multiplier
-                        ''',
-                        (
-                            model_raw,
-                            migrator.MODEL_ENDPOINT_ALIASES.get(endpoint_in, endpoint_in),
-                            r.get('author') or inferred_author or '',
-                            migrator.canonical_model_display_name(model_raw),
-                            1.0 if r.get('pru_multiplier') in (None, '') else r.get('pru_multiplier'),
-                        ),
-                    )
+                            endpoint=excluded.endpoint, author=excluded.author,
+                            model=excluded.model, pru_multiplier=excluded.pru_multiplier
+                    ''', (raw, endpoint, author, model, pru))
+
             else:
                 conn.execute('DELETE FROM provider_pru_invoices')
                 for r in rows:
@@ -793,6 +1040,8 @@ class TrackerHandler(BaseHTTPRequestHandler):
 
 
 def main():
+    if sys.version_info < (3, 14):
+        raise SystemExit("Python 3.14+ is required for compressed OpenClaw transcripts.")
     args = parse_args()
     config = {
         'db': Path(args.db).expanduser().resolve(),
@@ -804,6 +1053,8 @@ def main():
         'sessions_dir': Path(args.sessions_dir).expanduser().resolve(),
         'openclaw_agents_dir': Path(args.openclaw_agents_dir).expanduser().resolve(),
         'codex_sessions_dir': Path(args.codex_sessions_dir).expanduser().resolve(),
+        'claude_projects_dir': Path(args.claude_projects_dir).expanduser().resolve(),
+        'kimi_code_dir': Path(args.kimi_code_dir).expanduser().resolve(),
         'channel_mapping': Path(args.channel_mapping).expanduser().resolve() if args.channel_mapping else None,
         'backups_dir': Path(args.backups_dir).expanduser().resolve(),
     }
